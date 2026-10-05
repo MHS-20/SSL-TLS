@@ -113,8 +113,11 @@ typedef unsigned char master_secret_type[ MASTER_SECRET_LENGTH ];
 #define RANDOM_LENGTH 32
 typedef unsigned char random_type[ RANDOM_LENGTH ];
 
+typedef enum { connection_end_client, connection_end_server } ConnectionEnd;
+
 typedef struct
 {
+  ConnectionEnd connection_end;
   master_secret_type master_secret;
   random_type client_random;
   random_type server_random;
@@ -133,8 +136,9 @@ typedef struct
   dh_key server_dh_key;
 
   // Internal state
+  int got_client_hello;
   int server_hello_done;
-  int server_finished;
+  int peer_finished;
   digest_ctx md5_handshake_digest;
   digest_ctx sha1_handshake_digest;
   char *unread_buffer;
@@ -277,6 +281,14 @@ ServerHello;
  */
 int tls_connect( int connection,
                  TLSParameters *parameters );
+
+/**
+ * Wait for a client hello and negotiate a TLS channel as the server
+ *. Expects cert.der and key.pkcs8 in the working directory.
+ * @return 0 if successful, non-zero if not.
+ */
+int tls_accept( int connection,
+                TLSParameters *parameters );
 
 /**
  * Send data over an established TLS channel. tls_connect must already

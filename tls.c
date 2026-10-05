@@ -18,6 +18,11 @@
 #include "aes.h"
 #include "rc4.h"
 #include "rsa.h"
+#include "privkey.h"
+#include "file.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 static CipherSuite suites[] =
 {
@@ -138,8 +143,10 @@ static void init_parameters( TLSParameters *parameters )
   memset( parameters->master_secret, '\0', MASTER_SECRET_LENGTH );
   memset( parameters->client_random, '\0', RANDOM_LENGTH );
   memset( parameters->server_random, '\0', RANDOM_LENGTH );
+  // Internal state
+  parameters->got_client_hello = 0;
   parameters->server_hello_done = 0;
-  parameters->server_finished = 0;
+  parameters->peer_finished = 0;
   parameters->unread_buffer = NULL;
   parameters->unread_length = 0;
 }
@@ -496,18 +503,36 @@ static void calculate_keys( TLSParameters *parameters )
   send_parameters->IV = ( unsigned char * ) malloc( suite->IV_size );
   recv_parameters->IV = ( unsigned char * ) malloc( suite->IV_size );
 
-  key_block_ptr = read_buffer( send_parameters->MAC_secret, key_block,
-    suite->hash_size );
-  key_block_ptr = read_buffer( recv_parameters->MAC_secret, key_block_ptr,
-    suite->hash_size );
-  key_block_ptr = read_buffer( send_parameters->key, key_block_ptr,
-    suite->key_size );
-  key_block_ptr = read_buffer( recv_parameters->key, key_block_ptr,
-    suite->key_size );
-  key_block_ptr = read_buffer( send_parameters->IV, key_block_ptr,
-    suite->IV_size );
-  key_block_ptr = read_buffer( recv_parameters->IV, key_block_ptr,
-    suite->IV_size );
+  if ( parameters->connection_end == connection_end_client )
+  {
+    key_block_ptr = read_buffer( send_parameters->MAC_secret, key_block,
+      suite->hash_size );
+    key_block_ptr = read_buffer( recv_parameters->MAC_secret, key_block_ptr,
+      suite->hash_size );
+    key_block_ptr = read_buffer( send_parameters->key, key_block_ptr,
+      suite->key_size );
+    key_block_ptr = read_buffer( recv_parameters->key, key_block_ptr,
+      suite->key_size );
+    key_block_ptr = read_buffer( send_parameters->IV, key_block_ptr,
+      suite->IV_size );
+    key_block_ptr = read_buffer( recv_parameters->IV, key_block_ptr,
+      suite->IV_size );
+  }
+  else // I'm the server
+  {
+    key_block_ptr = read_buffer( recv_parameters->MAC_secret, key_block,
+      suite->hash_size );
+    key_block_ptr = read_buffer( send_parameters->MAC_secret, key_block_ptr,
+      suite->hash_size );
+    key_block_ptr = read_buffer( recv_parameters->key, key_block_ptr,
+      suite->key_size );
+    key_block_ptr = read_buffer( send_parameters->key, key_block_ptr,
+      suite->key_size );
+    key_block_ptr = read_buffer( recv_parameters->IV, key_block_ptr,
+      suite->IV_size );
+    key_block_ptr = read_buffer( send_parameters->IV, key_block_ptr,
+      suite->IV_size );
+  }
 
   switch ( suite->id )
   {
@@ -801,7 +826,10 @@ static int send_finished( int connection,
 {
   unsigned char verify_data[ VERIFY_DATA_LEN ];
 
-  compute_verify_data( "client finished", parameters, verify_data );
+  compute_verify_data(
+    parameters->connection_end == connection_end_client ?
+      "client finished" : "server finished",
+    parameters, verify_data );
   send_handshake_message( connection, finished, verify_data, VERIFY_DATA_LEN,
     parameters );
 
@@ -814,14 +842,273 @@ static unsigned char *parse_finished( unsigned char *read_pos,
 {
   unsigned char verify_data[ VERIFY_DATA_LEN ];
 
-  parameters->server_finished = 1;
+  parameters->peer_finished = 1;
 
-  compute_verify_data( "server finished", parameters, verify_data );
+  compute_verify_data(
+    parameters->connection_end == connection_end_client ?
+    "server finished" : "client finished",
+    parameters, verify_data );
 
   if ( memcmp( read_pos, verify_data, VERIFY_DATA_LEN ) )
   {
     return NULL;
   }
+
+  return read_pos + pdu_length;
+}
+
+
+static char *parse_client_hello( char *read_pos,
+                                 int pdu_length,
+                                 TLSParameters *parameters )
+{
+  int i;
+  ClientHello hello;
+
+  read_pos = read_buffer( ( void * ) &hello.client_version.major,
+    ( void * ) read_pos, 1 );
+  read_pos = read_buffer( ( void * ) &hello.client_version.minor,
+    ( void * ) read_pos, 1 );
+  read_pos = read_buffer( ( void * ) &hello.random.gmt_unix_time,
+    ( void * ) read_pos, 4 );
+  // *DON'T* put this in host order, since it's not used as a time! Just
+  // accept it as is
+  read_pos = read_buffer( ( void * ) hello.random.random_bytes,
+    ( void * ) read_pos, 28 );
+  read_pos = read_buffer( ( void * ) &hello.session_id_length,
+    ( void * ) read_pos, 1 );
+  hello.session_id = NULL;
+  if ( hello.session_id_length > 0 )
+  {
+    hello.session_id = ( unsigned char * ) malloc( hello.session_id_length );
+    read_pos = read_buffer( ( void * ) hello.session_id, ( void * ) read_pos,
+      hello.session_id_length );
+    // TODO if this is non-empty, the client is trying to trigger a restart
+  }
+  read_pos = read_buffer( ( void * ) &hello.cipher_suites_length,
+    ( void * ) read_pos, 2 );
+  hello.cipher_suites_length = ntohs( hello.cipher_suites_length );
+  hello.cipher_suites = ( unsigned short * ) malloc( hello.cipher_suites_length );
+  read_pos = read_buffer( ( void * ) hello.cipher_suites,
+                          ( void * ) read_pos,
+                          hello.cipher_suites_length );
+  read_pos = read_buffer( ( void * ) &hello.compression_methods_length,
+    ( void * ) read_pos, 1 );
+  hello.compression_methods = ( unsigned char * ) malloc(
+    hello.compression_methods_length );
+  read_pos = read_buffer( ( void * ) hello.compression_methods,
+                          ( void * ) read_pos,
+                          hello.compression_methods_length );
+
+  for ( i = 0; i < hello.cipher_suites_length / 2; i++ )
+  {
+    hello.cipher_suites[ i ] = ntohs( hello.cipher_suites[ i ] );
+    if ( hello.cipher_suites[ i ] < MAX_SUPPORTED_CIPHER_SUITE &&
+         suites[ hello.cipher_suites[ i ] ].bulk_encrypt != NULL )
+    {
+      parameters->pending_recv_parameters.suite = hello.cipher_suites[ i ];
+      parameters->pending_send_parameters.suite = hello.cipher_suites[ i ];
+      break;
+    }
+  }
+
+  if ( i == hello.cipher_suites_length / 2 )
+  {
+    return NULL;
+  }
+
+  parameters->got_client_hello = 1;
+
+  memcpy( ( void * ) parameters->client_random,
+    &hello.random.gmt_unix_time, 4 );
+  memcpy( ( void * ) ( parameters->client_random + 4 ),
+    ( void * ) hello.random.random_bytes, 28 );
+
+  free( hello.cipher_suites );
+  free( hello.compression_methods );
+  if ( hello.session_id )
+  {
+    free( hello.session_id );
+  }
+
+  return read_pos;
+}
+
+static int send_server_hello( int connection, TLSParameters *parameters )
+{
+  ServerHello package;
+  int send_buffer_size;
+  char *send_buffer;
+  void *write_buffer;
+  time_t local_time;
+
+  package.server_version.major = 3;
+  package.server_version.minor = 1;
+  time( &local_time );
+  package.random.gmt_unix_time = htonl( local_time );
+  // TODO - actually make this random.
+  // This is 28 bytes, but server random is 32 - the first four bytes of
+  // "server random" are the GMT unix time computed above.
+  memcpy( parameters->server_random, &package.random.gmt_unix_time, 4 );
+  memcpy( package.random.random_bytes, parameters->server_random + 4, 28 );
+  package.session_id_length = 0;
+  package.cipher_suite = htons( parameters->pending_send_parameters.suite );
+  package.compression_method = 0;
+
+  send_buffer_size = sizeof( ProtocolVersion ) +
+    sizeof( Random ) +
+    sizeof( unsigned char ) +
+    ( sizeof( unsigned char ) * package.session_id_length ) +
+    sizeof( unsigned short ) +
+    sizeof( unsigned char );
+
+  write_buffer = send_buffer = ( char * ) malloc( send_buffer_size );
+
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.server_version.major, 1 );
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.server_version.minor, 1 );
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.random.gmt_unix_time, 4 );
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.random.random_bytes, 28 );
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.session_id_length, 1 );
+  if ( package.session_id_length > 0 )
+  {
+    write_buffer = append_buffer( write_buffer, ( void * )package.session_id,
+      package.session_id_length );
+  }
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.cipher_suite, 2 );
+  write_buffer = append_buffer( write_buffer,
+    ( void * ) &package.compression_method, 1 );
+
+  assert( ( ( char * ) write_buffer - send_buffer ) == send_buffer_size );
+
+  send_handshake_message( connection, server_hello, send_buffer,
+    send_buffer_size, parameters );
+
+  free( send_buffer );
+
+  return 0;
+}
+
+static int send_certificate( int connection, TLSParameters *parameters )
+{
+  short send_buffer_size;
+  unsigned char *send_buffer, *read_buffer;
+  int certificate_file;
+  struct stat certificate_stat;
+  short cert_len;
+
+  if ( ( certificate_file = open( "cert.der", O_RDONLY ) ) == -1 )
+  {
+    perror( "unable to load certificate file" );
+    return 1;
+  }
+
+  if ( fstat( certificate_file, &certificate_stat ) == -1 )
+  {
+    perror( "unable to stat certificate file" );
+    return 1;
+  }
+
+  // Allocate enough space for the certificate file, plus 2 3-byte length
+  // entries.
+  send_buffer_size = certificate_stat.st_size + 6;
+  send_buffer = ( unsigned char * ) malloc( send_buffer_size );
+  memset( send_buffer, '\0', send_buffer_size );
+  cert_len = certificate_stat.st_size + 3;
+  cert_len = htons( cert_len );
+  memcpy( ( void * ) ( send_buffer + 1 ), &cert_len, 2 );
+  cert_len = certificate_stat.st_size;
+  cert_len = htons( cert_len );
+  memcpy( ( void * ) ( send_buffer + 4 ), &cert_len, 2 );
+
+  read_buffer = send_buffer + 6;
+  cert_len = certificate_stat.st_size;
+
+  while ( ( read_buffer - send_buffer ) < send_buffer_size )
+  {
+    int read_size;
+    read_size = read( certificate_file, read_buffer, cert_len );
+    read_buffer += read_size;
+    cert_len -= read_size;
+  }
+
+  if ( close( certificate_file ) == -1 )
+  {
+    perror( "unable to close certificate file" );
+    return 1;
+  }
+
+  send_handshake_message( connection, certificate, send_buffer,
+    send_buffer_size, parameters );
+
+  free( send_buffer );
+
+  return 0;
+}
+
+static int send_server_hello_done( int connection, TLSParameters *parameters )
+{
+  send_handshake_message( connection, server_hello_done, NULL, 0, parameters );
+
+  return 0;
+}
+
+/**
+ * By the time this is called, "read_pos" points at an RSA encrypted (unless
+ * RSA isn't used for key exchange) premaster secret. All this routine has to
+ * do is decrypt it. See "privkey.c" for details.
+ * TODO expand this to support Diffie-Hellman key exchange
+ */
+static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
+                                                 int pdu_length,
+                                                 TLSParameters *parameters )
+{
+  int premaster_secret_length;
+  unsigned char *buffer;
+  int buffer_length;
+  unsigned char *premaster_secret;
+  rsa_key private_key;
+
+  // TODO make this configurable
+  // XXX this really really should be buffered
+  if ( !( buffer = load_file_into_memory( "key.pkcs8", &buffer_length ) ) )
+  {
+    perror( "Unable to load file" );
+    return 0;
+  }
+
+  parse_pkcs8_private_key( &private_key, buffer, buffer_length, "password" );
+  free( buffer );
+
+  // Skip over the two length bytes, since length is already known anyway
+  premaster_secret_length = rsa_decrypt( read_pos + 2, pdu_length - 2,
+    &premaster_secret, &private_key );
+
+  if ( premaster_secret_length <= 0 )
+  {
+    fprintf( stderr, "Unable to decrypt premaster secret.\n" );
+    return NULL;
+  }
+
+  free_huge( private_key.modulus );
+  free_huge( private_key.exponent );
+  free( private_key.modulus );
+  free( private_key.exponent );
+
+  // Now use the premaster secret to compute the master secret. Don't forget
+  // that the first two bytes of the premaster secret are the version 0x03 0x01
+  // These are part of the premaster secret (8.1.1 states that the premaster
+  // secret for RSA is exactly 48 bytes long).
+  compute_master_secret( premaster_secret, MASTER_SECRET_LENGTH, parameters );
+
+  calculate_keys( parameters );
+
+  free( premaster_secret );
 
   return read_pos + pdu_length;
 }
@@ -1126,6 +1413,27 @@ static int receive_tls_msg( int connection,
       // Now, depending on the type, read in and process the packet itself.
       switch ( handshake.msg_type )
       {
+        // Server-side messages
+        case client_hello:
+          if ( parse_client_hello( read_pos, handshake.length,
+                                   parameters ) == NULL )
+          {
+            send_alert_message( connection, illegal_parameter,
+              &parameters->active_send_parameters );
+            return -1;
+          }
+          read_pos += handshake.length;
+          break;
+        case client_key_exchange:
+          read_pos = parse_client_key_exchange( read_pos, handshake.length,
+            parameters );
+          if ( read_pos == NULL )
+          {
+            send_alert_message( connection, illegal_parameter,
+              &parameters->active_send_parameters );
+            return -1;
+          }
+          break;
         // Client-side messages
         case server_hello:
           read_pos = parse_server_hello( read_pos, handshake.length, parameters );
@@ -1258,6 +1566,7 @@ int tls_connect( int connection,
                  TLSParameters *parameters )
 {
   init_parameters( parameters );
+  parameters->connection_end = connection_end_client;
   new_md5_digest( &parameters->md5_handshake_digest );
   new_sha1_digest( &parameters->sha1_handshake_digest );
 
@@ -1301,8 +1610,8 @@ int tls_connect( int connection,
     return 5;
   }
 
-  parameters->server_finished = 0;
-  while ( !parameters->server_finished )
+  parameters->peer_finished = 0;
+  while ( !parameters->peer_finished )
   {
     if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
     {
@@ -1311,6 +1620,85 @@ int tls_connect( int connection,
     }
   }
 
+  return 0;
+}
+
+int tls_accept( int connection,
+                TLSParameters *parameters )
+{
+  init_parameters( parameters );
+  parameters->connection_end = connection_end_server;
+
+  new_md5_digest( &parameters->md5_handshake_digest );
+  new_sha1_digest( &parameters->sha1_handshake_digest );
+
+  // The client sends the first message
+  parameters->got_client_hello = 0;
+  while ( !parameters->got_client_hello )
+  {
+    if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
+    {
+      perror( "Unable to receive client hello" );
+      send_alert_message( connection, handshake_failure,
+        &parameters->active_send_parameters );
+      return 1;
+    }
+  }
+
+  if ( send_server_hello( connection, parameters ) )
+  {
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 2;
+  }
+
+  if ( send_certificate( connection, parameters ) )
+  {
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 3;
+  }
+
+  if ( send_server_hello_done( connection, parameters ) )
+  {
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 4;
+  }
+
+  // Now the client should send a client key exchange, change cipher spec, and
+  // an encrypted "finalize" message
+  parameters->peer_finished = 0;
+  while ( !parameters->peer_finished )
+  {
+    if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
+    {
+      perror( "Unable to receive client finished" );
+      send_alert_message( connection, handshake_failure,
+        &parameters->active_send_parameters );
+      return 5;
+    }
+  }
+
+  // Finally, send server change cipher spec/finished message
+  if ( !( send_change_cipher_spec( connection, parameters ) ) )
+  {
+    perror( "Unable to send client change cipher spec" );
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 6;
+  }
+
+  // This message will be encrypted using the newly negotiated keys
+  if ( !( send_finished( connection, parameters ) ) )
+  {
+    perror( "Unable to send client finished" );
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 7;
+  }
+
+  // Handshake is complete; now ready to start sending encrypted data
   return 0;
 }
 
