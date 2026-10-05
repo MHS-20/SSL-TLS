@@ -131,15 +131,19 @@ typedef struct
   unsigned char *IV;
   CipherSuiteIdentifier suite;
   unsigned long seq_num;
+  // negotiated minor version; decides the record version and whether CBC
+  // records carry an explicit IV
+  unsigned char version;
 }
 ProtectionParameters;
 
 #define TLS_VERSION_MAJOR 3
-// 1 = TLS 1.0 (-8); build with -DTLS_VERSION_MINOR=3 for TLS 1.2
-//. 2 (TLS 1.1) only adds the explicit CBC IV.
-#ifndef TLS_VERSION_MINOR
-#define TLS_VERSION_MINOR 1
-#endif
+// Minor version numbers. the original compiles one version in (-8 use
+// 3.1,  changes it to 3.3); here the version is negotiated at run
+// time between tls_set_version_range's bounds (default TLS 1.0 - TLS 1.2).
+#define TLS_1_0 1
+#define TLS_1_1 2
+#define TLS_1_2 3
 
 #define MASTER_SECRET_LENGTH 48
 typedef unsigned char master_secret_type[ MASTER_SECRET_LENGTH ];
@@ -155,6 +159,10 @@ typedef enum { connection_end_client, connection_end_server } ConnectionEnd;
 typedef struct
 {
   ConnectionEnd connection_end;
+  // negotiated minor version (0 until the hellos are exchanged), and the
+  // version the client offered (the RSA premaster secret repeats it)
+  unsigned char version;
+  unsigned char client_version;
   master_secret_type master_secret;
   random_type client_random;
   random_type server_random;
@@ -378,6 +386,12 @@ void init_tls();
 
 /** Test hook: the single cipher suite the client hello offers. */
 void tls_set_client_cipher_suite( unsigned short suite );
+
+/**
+ * Restrict the protocol versions this side negotiates, as minor version
+ * numbers (TLS_1_0 .. TLS_1_2). Applies to clients and servers.
+ */
+void tls_set_version_range( int min_version, int max_version );
 
 /**
  * Wait for a client hello and negotiate a TLS channel as the server

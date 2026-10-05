@@ -75,15 +75,6 @@ void PRF( const unsigned char *secret,
           unsigned char *output,
           int out_len )
 {
-#if TLS_VERSION_MINOR >= 3
-  // TLS 1.2: a single P_hash with SHA-256 over the whole secret
-  unsigned char *concat = ( unsigned char * ) malloc( label_len + seed_len );
-  memcpy( concat, label, label_len );
-  memcpy( concat + label_len, seed, seed_len );
-  P_hash( secret, secret_len, concat, label_len + seed_len, output,
-    out_len, new_sha256_digest );
-  free( concat );
-#else
   int i;
   int half_secret_len;
   unsigned char *sha1_out = ( unsigned char * ) malloc( out_len );
@@ -104,7 +95,28 @@ void PRF( const unsigned char *secret,
 
   free( sha1_out );
   free( concat );
-#endif
+}
+
+/**
+ * The TLS 1.2 PRF (RFC 5246 section 5): a single P_hash with SHA-256 over
+ * the whole secret.
+ */
+void PRF_sha256( const unsigned char *secret,
+                 int secret_len,
+                 const unsigned char *label,
+                 int label_len,
+                 const unsigned char *seed,
+                 int seed_len,
+                 unsigned char *output,
+                 int out_len )
+{
+  // TLS 1.2: a single P_hash with SHA-256 over the whole secret
+  unsigned char *concat = ( unsigned char * ) malloc( label_len + seed_len );
+  memcpy( concat, label, label_len );
+  memcpy( concat + label_len, seed, seed_len );
+  P_hash( secret, secret_len, concat, label_len + seed_len, output,
+    out_len, new_sha256_digest );
+  free( concat );
 }
 
 #ifdef TEST_PRF
@@ -118,11 +130,19 @@ int main( int argc, char *argv[ ] )
   unsigned char *secret;
   unsigned char *label;
   unsigned char *seed;
+  int sha256 = 0;
+
+  if ( argc > 1 && !strcmp( argv[ 1 ], "-sha256" ) )
+  {
+    sha256 = 1;
+    argc--;
+    argv++;
+  }
 
   if ( argc < 5 )
   {
     fprintf( stderr,
-      "usage: %s [0x]<secret> [0x]<label> [0x]<seed> <output len>\n",
+      "usage: %s [-sha256] [0x]<secret> [0x]<label> [0x]<seed> <output len>\n",
       argv[ 0 ] );
     exit( 0 );
   }
@@ -134,7 +154,7 @@ int main( int argc, char *argv[ ] )
 
   output = ( unsigned char * ) malloc( out_len );
 
-  PRF( secret, secret_len,
+  ( sha256 ? PRF_sha256 : PRF )( secret, secret_len,
        label, label_len,
        seed, seed_len,
        output, out_len );

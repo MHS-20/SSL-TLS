@@ -161,6 +161,12 @@ int main( int argc, char *argv[ ] )
 
   local_addr.sin_family = AF_INET;
   local_addr.sin_port = htons( argc > 1 ? atoi( argv[ 1 ] ) : HTTPS_PORT );
+  if ( argc > 2 )
+  {
+    // optional maximum version: 1.0, 1.1 or 1.2
+    int minor = atoi( strchr( argv[ 2 ], '.' ) + 1 ) + 1;
+    tls_set_version_range( TLS_1_0, minor );
+  }
   local_addr.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
   //local_addr.sin_addr.s_addr = htonl( INADDR_ANY );
 

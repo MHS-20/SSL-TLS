@@ -31,6 +31,7 @@ check hmac-sha1-long aa4ae5e15272d00e95705637ce8a3b55ed402112 ./hmac_test -sha1 
   0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   "Test Using Larger Than Block-Size Key - Hash Key First"
 check prf-reference       b5baf4722b91851a8816d22ebd8c1d8cc2e94d55 ./prf_test secret label seed 20
+check prf-sha256     e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a ./prf_test -sha256 0x9bbe436ba940f017b17652849a71db35 "test label" 0xa0ba9f936cda311827a6f796ffd5198c 100
 check dsa-reference       14297f2522458d809b6c5752d3975a00bb0d89e0 ./dsa_test
 check ecdsa-reference     "Signature verified." ./ecdsa_test
 check sslv2-replay   "GET request      matches the reference" ./ssl2_test

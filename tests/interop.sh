@@ -67,21 +67,24 @@ server() {
 
 S0='@SECLEVEL=0'
 B=$ROOT
-client tls10-rsa-aes128        $B/https -c 2f   -- -tls1   -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
-client tls10-dhe-rsa           $B/https -c 33   -- -tls1   -cert cert.pem -key key.pem -cipher "DHE-RSA-AES128-SHA:$S0"
-client tls10-ecdhe-rsa         $B/https -c c013 -- -tls1   -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-SHA:$S0"
-client tls10-ecdhe-ecdsa       $B/https -c c009 -- -tls1   -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-SHA:$S0"
-client tls12-rsa-aes128        $B/https12 -c 2f   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
-client tls12-rsa-aes256        $B/https12 -c 35   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES256-SHA:$S0"
-client tls12-rsa-gcm           $B/https12 -c 9c   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES128-GCM-SHA256:$S0"
-client tls12-dhe-rsa           $B/https12 -c 33   -- -tls1_2 -cert cert.pem -key key.pem -cipher "DHE-RSA-AES128-SHA:$S0"
-client tls12-ecdhe-rsa         $B/https12 -c c013 -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-SHA:$S0"
-client tls12-ecdhe-ecdsa       $B/https12 -c c009 -- -tls1_2 -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-SHA:$S0"
-CLIENT_DIR=client client tls12-client-auth $B/https12 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
+client tls10-rsa-aes128        $B/https -V 1.0 -c 2f   -- -tls1   -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
+client tls10-dhe-rsa           $B/https -V 1.0 -c 33   -- -tls1   -cert cert.pem -key key.pem -cipher "DHE-RSA-AES128-SHA:$S0"
+client tls10-ecdhe-rsa         $B/https -V 1.0 -c c013 -- -tls1   -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-SHA:$S0"
+client tls10-ecdhe-ecdsa       $B/https -V 1.0 -c c009 -- -tls1   -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-SHA:$S0"
+client tls12-rsa-aes128        $B/https -V 1.2 -c 2f   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
+client tls12-rsa-aes256        $B/https -V 1.2 -c 35   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES256-SHA:$S0"
+client tls12-rsa-gcm           $B/https -V 1.2 -c 9c   -- -tls1_2 -cert cert.pem -key key.pem -cipher "AES128-GCM-SHA256:$S0"
+client tls12-dhe-rsa           $B/https -V 1.2 -c 33   -- -tls1_2 -cert cert.pem -key key.pem -cipher "DHE-RSA-AES128-SHA:$S0"
+client tls12-ecdhe-rsa         $B/https -V 1.2 -c c013 -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-SHA:$S0"
+client tls12-ecdhe-ecdsa       $B/https -V 1.2 -c c009 -- -tls1_2 -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-SHA:$S0"
+CLIENT_DIR=client client tls12-client-auth $B/https -V 1.2 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
   -cipher "AES128-SHA:$S0" -Verify 1 -CAfile root-cert.pem
 server tls10-server            $B/ssl_webserver   -- -tls1   -legacy_server_connect -cipher "AES128-SHA:$S0"
-server tls12-server-cbc        $B/ssl_webserver12 -- -tls1_2 -legacy_server_connect -cipher "AES128-SHA:$S0"
-server tls12-server-gcm        $B/ssl_webserver12 -- -tls1_2 -legacy_server_connect -cipher "AES128-GCM-SHA256:$S0"
+server tls12-server-cbc        $B/ssl_webserver -- -tls1_2 -legacy_server_connect -cipher "AES128-SHA:$S0"
+client tls11-rsa-aes128        $B/https -V 1.1 -c 2f -- -tls1_1 -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
+client negotiate-default       $B/https -- -cert cert.pem -key key.pem -cipher "ALL:$S0"
+server tls11-server            $B/ssl_webserver -- -tls1_1 -legacy_server_connect -cipher "AES128-SHA:$S0"
+server tls12-server-gcm        $B/ssl_webserver -- -tls1_2 -legacy_server_connect -cipher "AES128-GCM-SHA256:$S0"
 
 echo "$FAILS failure(s)"
 exit $FAILS

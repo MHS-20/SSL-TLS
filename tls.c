@@ -135,6 +135,7 @@ static void init_protection_parameters( ProtectionParameters *parameters )
   parameters->IV = NULL;
   parameters->seq_num = 0;
   parameters->suite = TLS_NULL_WITH_NULL_NULL;
+  parameters->version = 0;
 }
 
 static void init_parameters( TLSParameters *parameters,
@@ -147,6 +148,8 @@ static void init_parameters( TLSParameters *parameters,
   {
     init_protection_parameters( &parameters->active_send_parameters );
     init_protection_parameters( &parameters->active_recv_parameters );
+
+    parameters->version = 0;
 
     // Always assume secure renegotiation to begin
     parameters->support_secure_renegotiation = 1;
@@ -211,7 +214,7 @@ static int send_message( int connection,
 
   header.type = content_type;
   header.version.major = TLS_VERSION_MAJOR;
-  header.version.minor = TLS_VERSION_MINOR;
+  header.version.minor = parameters->version ? parameters->version : TLS_1_0;
   header.length = htons( content_len );
   mac_header[ 8 ] = header.type;
   mac_header[ 9 ] = header.version.major;
@@ -281,18 +284,16 @@ static int send_message( int connection,
     unsigned char *encrypted_buffer;
     int explicit_iv_len = 0;
 
-#if TLS_VERSION_MINOR >= 2
     // TLS 1.1+ sends the CBC IV in front of each record instead of
     // chaining it from the previous record
     if ( active_suite->aead_encrypt )
     {
       explicit_iv_len = AEAD_EXPLICIT_NONCE_LEN;
     }
-    else if ( active_suite->block_size )
+    else if ( active_suite->block_size && parameters->version >= TLS_1_1 )
     {
       explicit_iv_len = active_suite->IV_size;
     }
-#endif
 
     encrypted_buffer = malloc( send_buffer_size + explicit_iv_len );
     // The first 5 bytes (the header) and the IV aren't encrypted
@@ -392,7 +393,74 @@ static int send_alert_message( int connection,
 }
 
 // lets the test client offer a different single suite
-static unsigned short client_cipher_suite = TLS_RSA_WITH_AES_128_CBC_SHA;
+// 0 = offer the default list below; set by tls_set_client_cipher_suite
+static unsigned short client_cipher_suite = 0;
+
+// Offered in preference order: forward-secret ECDHE first, then plain RSA.
+static const unsigned short default_client_suites[] =
+{
+  TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+  TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+  TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+  TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+  TLS_RSA_WITH_AES_128_GCM_SHA256,
+  TLS_DHE_RSA_WITH_AES_128_CBC_SHA,
+  TLS_RSA_WITH_AES_128_CBC_SHA,
+  TLS_RSA_WITH_AES_256_CBC_SHA
+};
+#define NUM_DEFAULT_CLIENT_SUITES \
+  ( sizeof( default_client_suites ) / sizeof( unsigned short ) )
+
+static int min_version = TLS_1_0;
+static int max_version = TLS_1_2;
+
+void tls_set_version_range( int min, int max )
+{
+  min_version = min;
+  max_version = max;
+}
+
+/**
+ * AEAD suites only exist from TLS 1.2 on.
+ */
+static int suite_allowed( unsigned short id, int version )
+{
+  if ( id >= MAX_SUPPORTED_CIPHER_SUITE )
+  {
+    return 0;
+  }
+  if ( suites[ id ].aead_encrypt )
+  {
+    return version >= TLS_1_2;
+  }
+  return suites[ id ].bulk_encrypt != NULL;
+}
+
+/**
+ * Record the negotiated version everywhere the record layer looks for it.
+ */
+static void set_version( TLSParameters *parameters, int version )
+{
+  parameters->version = version;
+  parameters->pending_send_parameters.version = version;
+  parameters->pending_recv_parameters.version = version;
+  parameters->active_send_parameters.version = version;
+  parameters->active_recv_parameters.version = version;
+}
+
+/**
+ * The PRF of the negotiated version: MD5 xor SHA-1 before TLS 1.2,
+ * SHA-256 from TLS 1.2 on.
+ */
+static void tls_prf( TLSParameters *parameters,
+                     const unsigned char *secret, int secret_len,
+                     const unsigned char *label, int label_len,
+                     const unsigned char *seed, int seed_len,
+                     unsigned char *output, int out_len )
+{
+  ( parameters->version >= TLS_1_2 ? PRF_sha256 : PRF )( secret, secret_len,
+    label, label_len, seed, seed_len, output, out_len );
+}
 
 void tls_set_client_cipher_suite( unsigned short suite )
 {
@@ -498,12 +566,10 @@ static unsigned short add_client_hello_extensions( unsigned char **extensions,
     { 0x00, 0x04, 0x00, secp256r1, 0x00, secp192r1 };
   static const unsigned char supported_point_formats[] =
     { 0x01, uncompressed };
-#if TLS_VERSION_MINOR >= 3
   // RFC 5246 7.4.1.4.1: without this a TLS 1.2 server assumes SHA-1
   static const unsigned char supported_signature_algorithms[] =
     { 0x00, 0x08, sha256, sig_rsa, sha256, sig_ecdsa,
       sha1, sig_rsa, sha1, sig_ecdsa };
-#endif
 
   if ( parameters->support_secure_renegotiation )
   {
@@ -527,11 +593,12 @@ static unsigned short add_client_hello_extensions( unsigned char **extensions,
     supported_curves, sizeof( supported_curves ) );
   write_ptr = append_extension( write_ptr, ec_point_formats,
     supported_point_formats, sizeof( supported_point_formats ) );
-#if TLS_VERSION_MINOR >= 3
-  write_ptr = append_extension( write_ptr, signature_algorithms,
-    supported_signature_algorithms,
-    sizeof( supported_signature_algorithms ) );
-#endif
+  if ( max_version >= TLS_1_2 )
+  {
+    write_ptr = append_extension( write_ptr, signature_algorithms,
+      supported_signature_algorithms,
+      sizeof( supported_signature_algorithms ) );
+  }
 
   return write_ptr - *extensions;
 }
@@ -548,7 +615,9 @@ static int send_client_hello( int connection,
   unsigned char *extensions;
   unsigned short extensions_length;
   ClientHello package;
-  unsigned short supported_suites[ 1 ];
+  unsigned short supported_suites[ NUM_DEFAULT_CLIENT_SUITES ];
+  int num_suites = 0;
+  int i;
   unsigned char supported_compression_methods[ 1 ];
   int send_buffer_size;
   char *send_buffer;
@@ -557,7 +626,8 @@ static int send_client_hello( int connection,
   int status = 1;
 
   package.client_version.major = TLS_VERSION_MAJOR;
-  package.client_version.minor = TLS_VERSION_MINOR;
+  package.client_version.minor = max_version;
+  parameters->client_version = max_version;
   time( &local_time );
   package.random.gmt_unix_time = htonl( local_time );
   // This is 28 bytes, but client random is 32 - the first four bytes of
@@ -576,8 +646,21 @@ static int send_client_hello( int connection,
     package.session_id = NULL;
   }
   // note that this is bytes, not count.
-  package.cipher_suites_length = htons( 2 );
-  supported_suites[ 0 ] = htons( client_cipher_suite );
+  if ( client_cipher_suite )
+  {
+    supported_suites[ num_suites++ ] = htons( client_cipher_suite );
+  }
+  else
+  {
+    for ( i = 0; i < NUM_DEFAULT_CLIENT_SUITES; i++ )
+    {
+      if ( suite_allowed( default_client_suites[ i ], max_version ) )
+      {
+        supported_suites[ num_suites++ ] = htons( default_client_suites[ i ] );
+      }
+    }
+  }
+  package.cipher_suites_length = htons( num_suites * 2 );
   package.cipher_suites = supported_suites;
   package.compression_methods_length = 1;
   supported_compression_methods[ 0 ] = 0;
@@ -589,7 +672,7 @@ static int send_client_hello( int connection,
     sizeof( unsigned char ) +
     ( sizeof( unsigned char ) * package.session_id_length ) +
     sizeof( unsigned short ) +
-    ( sizeof( unsigned short ) * 1 ) +
+    ( sizeof( unsigned short ) * num_suites ) +
     sizeof( unsigned char ) +
     sizeof( unsigned char );
 
@@ -621,7 +704,7 @@ static int send_client_hello( int connection,
   write_buffer = append_buffer( write_buffer,
     ( void * ) &package.cipher_suites_length, 2 );
   write_buffer = append_buffer( write_buffer,
-    ( void * ) package.cipher_suites, 2 );
+    ( void * ) package.cipher_suites, num_suites * 2 );
   write_buffer = append_buffer( write_buffer,
     ( void * ) &package.compression_methods_length, 1 );
   if ( package.compression_methods_length > 0 )
@@ -730,6 +813,24 @@ static char *parse_server_hello( char *read_pos,
     ( void * ) read_pos, 2 );
   hello.cipher_suite = ntohs( hello.cipher_suite );
 
+  if ( hello.server_version.major != TLS_VERSION_MAJOR ||
+       hello.server_version.minor < min_version ||
+       hello.server_version.minor > max_version )
+  {
+    fprintf( stderr, "Error, server chose unsupported version %d.%d\n",
+      hello.server_version.major, hello.server_version.minor );
+    return NULL;
+  }
+  set_version( parameters, hello.server_version.minor );
+
+  if ( !suite_allowed( hello.cipher_suite, parameters->version ) ||
+       ( client_cipher_suite && hello.cipher_suite != client_cipher_suite ) )
+  {
+    fprintf( stderr, "Error, server chose cipher suite 0x%04x, which "
+      "wasn't offered.\n", hello.cipher_suite );
+    return NULL;
+  }
+
   // TODO check that these values were actually in the client hello
   // list.
   parameters->pending_recv_parameters.suite = hello.cipher_suite;
@@ -797,7 +898,7 @@ static void calculate_keys( TLSParameters *parameters )
   memcpy( seed, parameters->server_random, RANDOM_LENGTH );
   memcpy( seed + RANDOM_LENGTH, parameters->client_random, RANDOM_LENGTH );
 
-  PRF( parameters->master_secret, MASTER_SECRET_LENGTH,
+  tls_prf( parameters, parameters->master_secret, MASTER_SECRET_LENGTH,
     label, strlen( label ),
     seed, RANDOM_LENGTH * 2,
     key_block, key_block_length );
@@ -879,7 +980,7 @@ static void compute_master_secret( const unsigned char *premaster_secret,
                                    TLSParameters *parameters )
 {
   const char *label = "master secret";
-  PRF( premaster_secret, premaster_secret_len,
+  tls_prf( parameters, premaster_secret, premaster_secret_len,
        label, strlen( label ),
        // Note - cheating, since client_random & server_random are defined
        // sequentially in the structure
@@ -888,6 +989,7 @@ static void compute_master_secret( const unsigned char *premaster_secret,
 }
 
 int rsa_key_exchange( rsa_key *public_key,
+                      int parameters_client_version,
                       unsigned char *premaster_secret,
                       unsigned char **key_exchange_message )
 {
@@ -898,7 +1000,7 @@ int rsa_key_exchange( rsa_key *public_key,
 
   // first two bytes are protocol version
   premaster_secret[ 0 ] = TLS_VERSION_MAJOR;
-  premaster_secret[ 1 ] = TLS_VERSION_MINOR;
+  premaster_secret[ 1 ] = parameters_client_version;
   random_bytes( premaster_secret + 2, MASTER_SECRET_LENGTH - 2 );
 
   encrypted_length = rsa_encrypt( premaster_secret, MASTER_SECRET_LENGTH,
@@ -1060,6 +1162,7 @@ static int send_client_key_exchange( int connection, TLSParameters *parameters )
       premaster_secret = malloc( premaster_secret_len );
       key_exchange_message_len = rsa_key_exchange(
         &parameters->server_public_key.rsa_public_key,
+        parameters->client_version,
         premaster_secret, &key_exchange_message );
       break;
     case TLS_DH_DSS_EXPORT_WITH_DES40_CBC_SHA:
@@ -1162,7 +1265,8 @@ static int send_change_cipher_spec( int connection, TLSParameters *parameters )
 int compute_handshake_hash( TLSParameters *parameters,
                             unsigned char *handshake_hash )
 {
-#if TLS_VERSION_MINOR >= 3
+  if ( parameters->version >= TLS_1_2 )
+  {
   digest_ctx tmp_sha256_handshake_digest;
 
   memcpy( &tmp_sha256_handshake_digest, &parameters->sha256_handshake_digest,
@@ -1176,7 +1280,9 @@ int compute_handshake_hash( TLSParameters *parameters,
   free( tmp_sha256_handshake_digest.hash );
 
   return SHA256_BYTE_SIZE;
-#else
+  }
+  else
+  {
   digest_ctx tmp_md5_handshake_digest;
   digest_ctx tmp_sha1_handshake_digest;
 
@@ -1206,7 +1312,7 @@ int compute_handshake_hash( TLSParameters *parameters,
   free( tmp_sha1_handshake_digest.hash );
 
   return MD5_BYTE_SIZE + SHA1_BYTE_SIZE;
-#endif
+  }
 }
 
 /**
@@ -1232,7 +1338,7 @@ static void compute_verify_data( const char *finished_label,
   handshake_hash_len = compute_handshake_hash( parameters, handshake_hash );
 
   // First, compute the verify data
-  PRF( parameters->master_secret, MASTER_SECRET_LENGTH,
+  tls_prf( parameters, parameters->master_secret, MASTER_SECRET_LENGTH,
        finished_label, strlen( finished_label ),
        handshake_hash, handshake_hash_len,
        verify_data, VERIFY_DATA_LEN );
@@ -1529,7 +1635,7 @@ static void find_stored_session( int session_id_length,
 /**
  * the server only implements RSA key exchange.
  */
-static int server_supports_suite( unsigned short id )
+static int server_supports_suite( unsigned short id, int version )
 {
   switch ( id )
   {
@@ -1540,10 +1646,8 @@ static int server_supports_suite( unsigned short id )
     case TLS_RSA_WITH_AES_128_CBC_SHA:
     case TLS_RSA_WITH_AES_256_CBC_SHA:
       return 1;
-#if TLS_VERSION_MINOR >= 3
     case TLS_RSA_WITH_AES_128_GCM_SHA256:
-      return 1;
-#endif
+      return version >= TLS_1_2;
     default:
       return 0;
   }
@@ -1563,6 +1667,18 @@ static char *parse_client_hello( char *read_pos,
     ( void * ) read_pos, 1 );
   read_pos = read_buffer( ( void * ) &hello.client_version.minor,
     ( void * ) read_pos, 1 );
+
+  // negotiate the highest version both sides support
+  if ( hello.client_version.major != TLS_VERSION_MAJOR ||
+       hello.client_version.minor < min_version )
+  {
+    fprintf( stderr, "Client version %d.%d is not supported\n",
+      hello.client_version.major, hello.client_version.minor );
+    return NULL;
+  }
+  parameters->client_version = hello.client_version.minor;
+  set_version( parameters, hello.client_version.minor < max_version ?
+    hello.client_version.minor : max_version );
   read_pos = read_buffer( ( void * ) &hello.random.gmt_unix_time,
     ( void * ) read_pos, 4 );
   // *DON'T* put this in host order, since it's not used as a time! Just
@@ -1597,7 +1713,8 @@ static char *parse_client_hello( char *read_pos,
   for ( i = 0; i < hello.cipher_suites_length / 2; i++ )
   {
     hello.cipher_suites[ i ] = ntohs( hello.cipher_suites[ i ] );
-    if ( server_supports_suite( hello.cipher_suites[ i ] ) )
+    if ( server_supports_suite( hello.cipher_suites[ i ],
+                                parameters->version ) )
     {
       parameters->pending_recv_parameters.suite = hello.cipher_suites[ i ];
       parameters->pending_send_parameters.suite = hello.cipher_suites[ i ];
@@ -1651,7 +1768,7 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   time_t local_time;
 
   package.server_version.major = TLS_VERSION_MAJOR;
-  package.server_version.minor = TLS_VERSION_MINOR;
+  package.server_version.minor = parameters->version;
   time( &local_time );
   package.random.gmt_unix_time = htonl( local_time );
   // This is 28 bytes, but server random is 32 - the first four bytes of
@@ -1829,17 +1946,49 @@ static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
   return read_pos + pdu_length;
 }
 
-#if TLS_VERSION_MINOR >= 3
 static const unsigned char OID_sha1[] =
   { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
 static const unsigned char OID_sha256[] =
   { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
-#endif
+
+/**
+ * Hash client random, server random and message with the given algorithm
+ * (SHA-1 or SHA-256) into *digest. Returns 0 for an unsupported hash.
+ */
+static int hash_signed_params( HashAlgorithm hash_alg,
+                               unsigned char *message,
+                               int message_len,
+                               TLSParameters *parameters,
+                               digest_ctx *digest )
+{
+  switch ( hash_alg )
+  {
+    case md5:
+      new_md5_digest( digest );
+      break;
+    case sha1:
+      new_sha1_digest( digest );
+      break;
+    case sha256:
+      new_sha256_digest( digest );
+      break;
+    default:
+      fprintf( stderr, "Unsupported signature hash algorithm %d\n", hash_alg );
+      return 0;
+  }
+  update_digest( digest, parameters->client_random, RANDOM_LENGTH );
+  update_digest( digest, parameters->server_random, RANDOM_LENGTH );
+  update_digest( digest, message, message_len );
+  finalize_digest( digest );
+
+  return 1;
+}
 
 /**
  * Verify the signature on a server key exchange: a hash of client random,
  * server random and the key exchange parameters. hash_alg is only used by
- * TLS 1.2, where the signature names its own hash.
+ * TLS 1.2, where the signature names its own hash; before that, RSA signs
+ * MD5 + SHA-1 and DSA/ECDSA sign SHA-1.
  */
 static int verify_signature( unsigned char *message,
                              int message_len,
@@ -1848,42 +1997,20 @@ static int verify_signature( unsigned char *message,
                              HashAlgorithm hash_alg,
                              TLSParameters *parameters )
 {
-  // This is needed for RSA, DSA or ECDSA
   digest_ctx sha_digest;
+  int tls12 = parameters->version >= TLS_1_2;
+  int verified = 0;
 
-#if TLS_VERSION_MINOR >= 3
-  switch ( hash_alg )
+  if ( !hash_signed_params( tls12 ? hash_alg : sha1, message, message_len,
+                            parameters, &sha_digest ) )
   {
-    case sha1:
-      new_sha1_digest( &sha_digest );
-      break;
-    case sha256:
-      new_sha256_digest( &sha_digest );
-      break;
-    default:
-      fprintf( stderr, "Unsupported signature hash algorithm %d\n", hash_alg );
-      return 0;
+    return 0;
   }
-#else
-  new_sha1_digest( &sha_digest );
-#endif
-  update_digest( &sha_digest, parameters->client_random, RANDOM_LENGTH );
-  update_digest( &sha_digest, parameters->server_random, RANDOM_LENGTH );
-  update_digest( &sha_digest, message, message_len );
-  finalize_digest( &sha_digest );
 
   if ( parameters->server_public_key.algorithm == rsa )
   {
     unsigned char *decrypted_signature;
     int decrypted_signature_length;
-#if TLS_VERSION_MINOR >= 3
-    struct asn1struct rsa_signature;
-    struct asn1struct *hash_oid;
-    struct asn1struct *hash_value;
-    int valid;
-#else
-    digest_ctx md5_digest;
-#endif
 
     decrypted_signature_length = rsa_decrypt( signature, signature_len,
       &decrypted_signature,
@@ -1891,67 +2018,67 @@ static int verify_signature( unsigned char *message,
 
     if ( decrypted_signature_length < 0 )
     {
+      free( sha_digest.hash );
       return 0;
     }
 
-#if TLS_VERSION_MINOR >= 3
-    // TLS 1.2; no longer includes MD-5, just one hash,
-    // but the RSA signature also includes the signature scheme,
-    // so must be DER-decoded
-    if ( asn1parse( decrypted_signature, decrypted_signature_length,
-                    &rsa_signature ) )
+    if ( tls12 )
     {
-      free( decrypted_signature );
-      return 0;
+      // TLS 1.2; no longer includes MD-5, just one hash, but the RSA
+      // signature also includes the signature scheme, so must be
+      // DER-decoded
+      struct asn1struct rsa_signature;
+      struct asn1struct *hash_oid;
+      struct asn1struct *hash_value;
+      const unsigned char *expected_oid =
+        ( hash_alg == sha256 ) ? OID_sha256 : OID_sha1;
+      int expected_oid_len = ( hash_alg == sha256 ) ?
+        sizeof( OID_sha256 ) : sizeof( OID_sha1 );
+
+      if ( !asn1parse( decrypted_signature, decrypted_signature_length,
+                       &rsa_signature ) )
+      {
+        hash_oid = rsa_signature.children ?
+          rsa_signature.children->children : NULL;
+        hash_value = rsa_signature.children ?
+          rsa_signature.children->next : NULL;
+        verified = hash_oid && hash_value &&
+          hash_oid->length == expected_oid_len &&
+          !memcmp( hash_oid->data, expected_oid, expected_oid_len ) &&
+          hash_value->length == sha_digest.hash_len * sizeof( int ) &&
+          !memcmp( sha_digest.hash, hash_value->data, hash_value->length );
+        asn1free( &rsa_signature );
+      }
+    }
+    else
+    {
+      // If the signature algorithm is RSA, this will be the md5 hash,
+      // followed by the sha-1 hash of: client random, server random,
+      // params).
+      digest_ctx md5_digest;
+
+      hash_signed_params( md5, message, message_len, parameters,
+        &md5_digest );
+      verified = decrypted_signature_length ==
+                   MD5_BYTE_SIZE + SHA1_BYTE_SIZE &&
+        !memcmp( md5_digest.hash, decrypted_signature, MD5_BYTE_SIZE ) &&
+        !memcmp( sha_digest.hash, decrypted_signature + MD5_BYTE_SIZE,
+                 SHA1_BYTE_SIZE );
+      free( md5_digest.hash );
     }
 
-    hash_oid = rsa_signature.children->children;
-    hash_value = rsa_signature.children->next;
-    valid = ( hash_value->length == sha_digest.hash_len * sizeof( int ) ) &&
-      ( hash_alg == sha256 ?
-        ( hash_oid->length == sizeof( OID_sha256 ) &&
-          !memcmp( hash_oid->data, OID_sha256, sizeof( OID_sha256 ) ) ) :
-        ( hash_oid->length == sizeof( OID_sha1 ) &&
-          !memcmp( hash_oid->data, OID_sha1, sizeof( OID_sha1 ) ) ) ) &&
-      !memcmp( sha_digest.hash, hash_value->data, hash_value->length );
-
-    asn1free( &rsa_signature );
     free( decrypted_signature );
-
-    if ( !valid )
-    {
-      return 0;
-    }
-#else
-    // If the signature algorithm is RSA, this will be the md5 hash, followed by
-    // the sha-1 hash of: client random, server random, params).
-    // If DSA, this will just be the sha-1 hash
-    new_md5_digest( &md5_digest );
-    update_digest( &md5_digest, parameters->client_random, RANDOM_LENGTH );
-    update_digest( &md5_digest, parameters->server_random, RANDOM_LENGTH );
-    update_digest( &md5_digest, message, message_len );
-    finalize_digest( &md5_digest );
-
-    if ( memcmp( md5_digest.hash, decrypted_signature, MD5_BYTE_SIZE ) ||
-         memcmp( sha_digest.hash, decrypted_signature + MD5_BYTE_SIZE,
-                 SHA1_BYTE_SIZE ) )
-    {
-      free( decrypted_signature );
-      return 0;
-    }
-
-    free( decrypted_signature );
-#endif
   }
   else if ( ( parameters->server_public_key.algorithm == dsa ) ||
             ( parameters->server_public_key.algorithm == ecdsa ) )
   {
     struct asn1struct decoded_signature;
     dsa_signature received_signature;
-    int verified;
 
-    if ( asn1parse( signature, signature_len, &decoded_signature ) )
+    if ( asn1parse( signature, signature_len, &decoded_signature ) ||
+         !decoded_signature.children || !decoded_signature.children->next )
     {
+      free( sha_digest.hash );
       return 0;
     }
 
@@ -1986,17 +2113,11 @@ static int verify_signature( unsigned char *message,
 
     free_huge( &received_signature.r );
     free_huge( &received_signature.s );
-
-    if ( !verified )
-    {
-      free( sha_digest.hash );
-      return 0;
-    }
   }
 
   free( sha_digest.hash );
 
-  return 1;
+  return verified;
 }
 
 static char *parse_server_key_exchange( unsigned char *read_pos,
@@ -2087,11 +2208,12 @@ static char *parse_server_key_exchange( unsigned char *read_pos,
   {
     int params_length = read_pos - dh_params;
 
-#if TLS_VERSION_MINOR >= 3
-    hash_alg = read_pos[ 0 ];
-    sig_alg = read_pos[ 1 ];
-    read_pos += 2;
-#endif
+    if ( parameters->version >= TLS_1_2 )
+    {
+      hash_alg = read_pos[ 0 ];
+      sig_alg = read_pos[ 1 ];
+      read_pos += 2;
+    }
 
     memcpy( &length, read_pos, 2 );
     length = ntohs( length );
@@ -2157,7 +2279,7 @@ static unsigned char *parse_certificate_request( unsigned char *read_pos,
     }
   }
 
-#if TLS_VERSION_MINOR >= 3
+  if ( parameters->version >= TLS_1_2 )
   {
     unsigned short signature_algorithms_length;
 
@@ -2179,7 +2301,6 @@ static unsigned char *parse_certificate_request( unsigned char *read_pos,
       }
     }
   }
-#endif
 
   read_pos = read_buffer( ( void * ) &trusted_roots_length, read_pos, 2 );
   trusted_roots_length = htons( trusted_roots_length );
@@ -2331,9 +2452,8 @@ static int tls_decrypt( const unsigned char *header, // needed for MAC verificat
 
   if ( active_suite->bulk_decrypt )
   {
-#if TLS_VERSION_MINOR >= 2
     // TLS 1.1+: the first IV_size bytes of a block-ciphered record are its IV
-    if ( active_suite->block_size )
+    if ( active_suite->block_size && parameters->version >= TLS_1_1 )
     {
       if ( encrypted_length < active_suite->IV_size )
       {
@@ -2343,14 +2463,32 @@ static int tls_decrypt( const unsigned char *header, // needed for MAC verificat
       encrypted_message += active_suite->IV_size;
       encrypted_length -= active_suite->IV_size;
     }
-#endif
+    if ( active_suite->block_size &&
+         ( encrypted_length <= 0 ||
+           encrypted_length % active_suite->block_size ) )
+    {
+      return -1;
+    }
     active_suite->bulk_decrypt( encrypted_message, encrypted_length,
       *decrypted_message, parameters->IV, parameters->key );
     decrypted_length = encrypted_length;
     // Strip off padding
     if ( active_suite->block_size )
     {
-      decrypted_length -= ( (*decrypted_message)[ encrypted_length - 1 ] + 1 );
+      // every padding byte must equal the padding length,
+      // and padding plus MAC must fit in the record
+      int padding = (*decrypted_message)[ encrypted_length - 1 ];
+      int i, bad = padding + 1 + active_suite->hash_size > encrypted_length;
+
+      for ( i = 1; !bad && i <= padding; i++ )
+      {
+        bad |= (*decrypted_message)[ encrypted_length - 1 - i ] != padding;
+      }
+      if ( bad )
+      {
+        return -1;
+      }
+      decrypted_length -= ( padding + 1 );
     }
   }
   else if ( active_suite->aead_decrypt )
@@ -2761,18 +2899,17 @@ static int send_certificate_verify( int connection,
   unsigned char *signed_data;
   int signed_data_len;
   int header_len = 0;
-#if TLS_VERSION_MINOR >= 3
   // DER DigestInfo header for a SHA-256 hash (RFC 3447 9.2)
   static const unsigned char sha256_digest_info[] = { 0x30, 0x31, 0x30, 0x0d,
     0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
     0x00, 0x04, 0x20 };
   unsigned char digest_info[ sizeof( sha256_digest_info ) + SHA256_BYTE_SIZE ];
-#endif
 
   handshake_hash_len = compute_handshake_hash( parameters, handshake_hash );
   signed_data = handshake_hash;
   signed_data_len = handshake_hash_len;
-#if TLS_VERSION_MINOR >= 3
+  if ( parameters->version >= TLS_1_2 )
+  {
   // TLS 1.2 signs a DigestInfo of the SHA-256 handshake
   // hash and declares the algorithms in front of the signature
   memcpy( digest_info, sha256_digest_info, sizeof( sha256_digest_info ) );
@@ -2781,7 +2918,7 @@ static int send_certificate_verify( int connection,
   signed_data = digest_info;
   signed_data_len = sizeof( digest_info );
   header_len = 2;
-#endif
+  }
 
   if ( !( buffer = load_file_into_memory( "key.der", &buffer_length ) ) )
   {
@@ -2800,10 +2937,11 @@ static int send_certificate_verify( int connection,
   certificate_verify_message = ( unsigned char * )
     malloc( certificate_verify_message_len );
 
-#if TLS_VERSION_MINOR >= 3
-  certificate_verify_message[ 0 ] = sha256;
-  certificate_verify_message[ 1 ] = sig_rsa;
-#endif
+  if ( header_len )
+  {
+    certificate_verify_message[ 0 ] = sha256;
+    certificate_verify_message[ 1 ] = sig_rsa;
+  }
 
   // copying this "backwards" so that I can use the signature len
   // as a numeric input but then htons it to send on.

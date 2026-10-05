@@ -305,6 +305,12 @@ int main( int argc, char *argv[ ] )
     {
       session_id_length = hex_decode( argv[ ++ind ], &session_id );
     }
+    else if ( !strcmp( "-V", argv[ ind ] ) )
+    {
+      // pin the version: 1.0, 1.1 or 1.2
+      int minor = atoi( strchr( argv[ ++ind ], '.' ) + 1 ) + 1;
+      tls_set_version_range( minor, minor );
+    }
     else if ( !strcmp( "-c", argv[ ind ] ) )
     {
       tls_set_client_cipher_suite( strtol( argv[ ++ind ], NULL, 16 ) );
