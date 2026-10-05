@@ -50,7 +50,7 @@ asn1_test: asn1.c base64.c
 x509_test: x509.c asn1.c base64.c random.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_X509 -o $@ $^ $(LDLIBS)
 
-TLS_OBJS = random.c tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c sha512.c des.c aes.c rc4.c hex.c
+TLS_OBJS = random.c credentials.c tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c sha512.c des.c aes.c rc4.c hex.c
 
 https: https.c $(TLS_OBJS)
 	$(CC) $(CFLAGS) -O2 -o $@ $^ $(LDLIBS)

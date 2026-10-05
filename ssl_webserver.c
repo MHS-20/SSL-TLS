@@ -160,12 +160,41 @@ int main( int argc, char *argv[ ] )
   }
 
   local_addr.sin_family = AF_INET;
-  local_addr.sin_port = htons( argc > 1 ? atoi( argv[ 1 ] ) : HTTPS_PORT );
-  if ( argc > 2 )
+  local_addr.sin_port = htons( HTTPS_PORT );
   {
-    // optional maximum version: 1.0, 1.1 or 1.2
-    int minor = atoi( strchr( argv[ 2 ], '.' ) + 1 ) + 1;
-    tls_set_version_range( TLS_1_0, minor );
+    int i;
+    char *cert_file = NULL, *key_file = NULL, *password = NULL;
+
+    for ( i = 1; i < argc; i++ )
+    {
+      if ( !strcmp( argv[ i ], "-V" ) && i + 1 < argc )
+      {
+        int minor = atoi( strchr( argv[ ++i ], '.' ) + 1 ) + 1;
+        tls_set_version_range( TLS_1_0, minor );
+      }
+      else if ( !strcmp( argv[ i ], "-cert" ) && i + 1 < argc )
+      {
+        cert_file = argv[ ++i ];
+      }
+      else if ( !strcmp( argv[ i ], "-key" ) && i + 1 < argc )
+      {
+        key_file = argv[ ++i ];
+      }
+      else if ( !strcmp( argv[ i ], "-pass" ) && i + 1 < argc )
+      {
+        password = argv[ ++i ];
+      }
+      else
+      {
+        local_addr.sin_port = htons( atoi( argv[ i ] ) );
+      }
+    }
+    if ( cert_file && key_file &&
+         tls_set_credentials( cert_file, key_file, password ) )
+    {
+      fprintf( stderr, "Unable to load %s / %s\n", cert_file, key_file );
+      exit( 1 );
+    }
   }
   local_addr.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
   //local_addr.sin_addr.s_addr = htonl( INADDR_ANY );

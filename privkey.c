@@ -35,18 +35,23 @@ int parse_private_key( rsa_key *privkey,
   struct asn1struct *public_exponent;
   struct asn1struct *private_exponent;
 
-  asn1parse( buffer, buffer_length, &private_key );
-
-  version = ( struct asn1struct * ) private_key.children;
-  modulus = ( struct asn1struct * ) version->next;
-  // Just read this to skip over it
-  public_exponent = ( struct asn1struct * ) modulus->next;
-  private_exponent = ( struct asn1struct * ) public_exponent->next;
+  if ( asn1parse( buffer, buffer_length, &private_key ) ||
+       !( version = ( struct asn1struct * ) private_key.children ) ||
+       !( modulus = ( struct asn1struct * ) version->next ) ||
+       !( public_exponent = ( struct asn1struct * ) modulus->next ) ||
+       !( private_exponent = ( struct asn1struct * ) public_exponent->next ) )
+  {
+    asn1free( &private_key );
+    return 1;
+  }
 
   privkey->modulus = malloc( sizeof( huge ) );
   privkey->exponent = malloc( sizeof( huge ) );
   load_huge( privkey->modulus, modulus->data, modulus->length );
   load_huge( privkey->exponent, private_exponent->data, private_exponent->length );
+  // Drop the DER sign byte so the modulus has its real length
+  contract( privkey->modulus );
+  contract( privkey->exponent );
 
   asn1free( &private_key );
 

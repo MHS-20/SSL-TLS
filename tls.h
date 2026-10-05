@@ -186,6 +186,8 @@ typedef struct
   // ECDH curve and public point from an ECDHE server key exchange
   elliptic_curve server_ecdh_params;
   point server_ecdh_key;
+  // the server's ephemeral ECDH secret (server side only)
+  huge server_ecdh_secret;
 
   // Internal state
   int got_client_hello;
@@ -404,6 +406,16 @@ void tls_set_version_range( int min_version, int max_version );
  * loaded, or -1.
  */
 int tls_set_verify( const char *ca_file, const char *hostname );
+
+/**
+ * The certificate chain and RSA key this side presents: the server's
+ * identity, or the client's when the server asks for one. See
+ * credentials.h for the accepted formats. Without this the server falls
+ * back to the original cert.der + key.pkcs8 ("password"), and the client to
+ * cert.der + key.der. Returns 0 on success.
+ */
+int tls_set_credentials( const char *cert_file, const char *key_file,
+                         const char *password );
 
 /**
  * Wait for a client hello and negotiate a TLS channel as the server

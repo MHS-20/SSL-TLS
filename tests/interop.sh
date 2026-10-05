@@ -57,10 +57,12 @@ client() {
 
 # server <name> <server binary> -- <s_client args...>
 server() {
-  local name=$1 bin=$2; shift 3
+  local name=$1; shift
+  local sargs=()
+  while [ "$1" != "--" ]; do sargs+=("$1"); shift; done; shift
   wanted "$name" || return 0
   next_port
-  "$bin" $PORT > w.log 2>&1 &
+  "${sargs[0]}" $PORT "${sargs[@]:1}" > w.log 2>&1 &
   local wp=$!
   sleep 0.5
   printf 'GET / HTTP/1.0\r\n\r\n' | timeout 60 openssl s_client -connect localhost:$PORT \
@@ -87,12 +89,15 @@ client tls12-ecdhe-p384        $B/https -C $WORK/cert.pem -V 1.2 -c c02f -- -tls
 CLIENT_DIR=client client tls12-client-auth $B/https -C $WORK/cert.pem -V 1.2 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
   -cipher "AES128-SHA:$S0" -Verify 1 -CAfile root-cert.pem
 client reject-untrusted        $B/https -C $WORK/root-cert.pem -- -cert cert.pem -key key.pem -cipher "ALL:$S0"
-server tls10-server            $B/ssl_webserver   -- -tls1   -legacy_server_connect -cipher "AES128-SHA:$S0"
-server tls12-server-cbc        $B/ssl_webserver -- -tls1_2 -legacy_server_connect -cipher "AES128-SHA:$S0"
+server tls10-server            $B/ssl_webserver   -- -tls1   -cipher "AES128-SHA:$S0"
+server tls12-server-cbc        $B/ssl_webserver -- -tls1_2 -cipher "AES128-SHA:$S0"
 client tls11-rsa-aes128        $B/https -C $WORK/cert.pem -V 1.1 -c 2f -- -tls1_1 -cert cert.pem -key key.pem -cipher "AES128-SHA:$S0"
 client negotiate-default       $B/https -C $WORK/cert.pem -- -cert cert.pem -key key.pem -cipher "ALL:$S0"
-server tls11-server            $B/ssl_webserver -- -tls1_1 -legacy_server_connect -cipher "AES128-SHA:$S0"
-server tls12-server-gcm        $B/ssl_webserver -- -tls1_2 -legacy_server_connect -cipher "AES128-GCM-SHA256:$S0"
+server tls11-server            $B/ssl_webserver -- -tls1_1 -cipher "AES128-SHA:$S0"
+server tls12-server-ecdhe      $B/ssl_webserver -- -tls1_2 -cipher "ECDHE-RSA-AES128-GCM-SHA256:$S0"
+server tls10-server-ecdhe      $B/ssl_webserver -- -tls1 -cipher "ECDHE-RSA-AES128-SHA:$S0"
+server server-pem-default      $B/ssl_webserver -cert $WORK/cert.pem -key $WORK/key.pem -- -cipher "ALL:$S0"
+server tls12-server-gcm        $B/ssl_webserver -- -tls1_2 -cipher "AES128-GCM-SHA256:$S0"
 
 echo "$FAILS failure(s)"
 exit $FAILS

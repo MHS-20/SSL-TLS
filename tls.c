@@ -25,6 +25,7 @@
 #include "ecdsa.h"
 #include "random.h"
 #include "sha512.h"
+#include "credentials.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -433,6 +434,39 @@ int tls_set_verify( const char *ca_file, const char *hostname )
   free( expected_hostname );
   expected_hostname = hostname ? strdup( hostname ) : NULL;
   return trusted_roots_count;
+}
+
+static tls_credentials local_credentials;
+
+int tls_set_credentials( const char *cert_file, const char *key_file,
+                         const char *password )
+{
+  if ( local_credentials.loaded )
+  {
+    free_credentials( &local_credentials );
+  }
+  return load_credentials( &local_credentials, cert_file, key_file,
+    password );
+}
+
+/**
+ * Load the original default files if nothing was configured.
+ */
+static int have_credentials( ConnectionEnd connection_end )
+{
+  if ( !local_credentials.loaded )
+  {
+    if ( connection_end == connection_end_server )
+    {
+      load_credentials( &local_credentials, "cert.der", "key.pkcs8",
+        "password" );
+    }
+    else
+    {
+      load_credentials( &local_credentials, "cert.der", "key.der", NULL );
+    }
+  }
+  return local_credentials.loaded;
 }
 
 static int min_version = TLS_1_0;
@@ -1518,11 +1552,16 @@ static char *parse_client_hello_extensions( char *read_pos,
       case server_name:
         parse_server_name_extension( read_pos, extension_data_size,
           parameters );
-        printf( "Got server name extension\n" );
+        break;
+      case secure_renegotiation:
+        // RFC 5746 on the server side. On an initial
+        // handshake the extension must be empty.
+        if ( extension_data_size == 1 && read_pos[ 0 ] == 0 )
+        {
+          parameters->support_secure_renegotiation = 1;
+        }
         break;
       default:
-        printf( "warning, skipping unsupported client hello extension %d\n",
-          type );
         break;
     }
     read_pos += extension_data_size;
@@ -1708,7 +1747,11 @@ static int server_supports_suite( unsigned short id, int version )
     case TLS_RSA_WITH_AES_256_CBC_SHA:
       return 1;
     case TLS_RSA_WITH_AES_128_GCM_SHA256:
+    case TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
       return version >= TLS_1_2;
+    case TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:
+    case TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:
+      return 1;
     default:
       return 0;
   }
@@ -1771,6 +1814,16 @@ static char *parse_client_hello( char *read_pos,
                           ( void * ) read_pos,
                           hello.compression_methods_length );
 
+  // The renegotiation_info extension or the SCSV (RFC 5746 3.3) says the
+  // client does secure renegotiation
+  parameters->support_secure_renegotiation = 0;
+  for ( i = 0; i < hello.cipher_suites_length / 2; i++ )
+  {
+    if ( ntohs( hello.cipher_suites[ i ] ) == 0x00FF )
+    {
+      parameters->support_secure_renegotiation = 1;
+    }
+  }
   for ( i = 0; i < hello.cipher_suites_length / 2; i++ )
   {
     hello.cipher_suites[ i ] = ntohs( hello.cipher_suites[ i ] );
@@ -1822,6 +1875,8 @@ static int next_session_id = 1;
 
 static int send_server_hello( int connection, TLSParameters *parameters )
 {
+  unsigned char extensions[ 16 ];
+  int extensions_length;
   ServerHello package;
   int send_buffer_size;
   char *send_buffer;
@@ -1849,12 +1904,31 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   package.cipher_suite = htons( parameters->pending_send_parameters.suite );
   package.compression_method = 0;
 
+  // answer the client's extensions. renegotiation_info
+  // (empty: no renegotiation has happened) and, for ECDHE, the
+  // uncompressed point format.
+  {
+    unsigned char *ext = extensions;
+    if ( parameters->support_secure_renegotiation )
+    {
+      memcpy( ext, "\xFF\x01\x00\x01\x00", 5 );
+      ext += 5;
+    }
+    if ( is_ecdhe_suite( parameters->pending_send_parameters.suite ) )
+    {
+      memcpy( ext, "\x00\x0B\x00\x02\x01\x00", 6 );
+      ext += 6;
+    }
+    extensions_length = ext - extensions;
+  }
+
   send_buffer_size = sizeof( ProtocolVersion ) +
     sizeof( Random ) +
     sizeof( unsigned char ) +
     ( sizeof( unsigned char ) * package.session_id_length ) +
     sizeof( unsigned short ) +
-    sizeof( unsigned char );
+    sizeof( unsigned char ) +
+    ( extensions_length ? 2 + extensions_length : 0 );
 
   write_buffer = send_buffer = ( char * ) malloc( send_buffer_size );
 
@@ -1877,6 +1951,13 @@ static int send_server_hello( int connection, TLSParameters *parameters )
     ( void * ) &package.cipher_suite, 2 );
   write_buffer = append_buffer( write_buffer,
     ( void * ) &package.compression_method, 1 );
+  if ( extensions_length )
+  {
+    unsigned short length = htons( extensions_length );
+    write_buffer = append_buffer( write_buffer, ( void * ) &length, 2 );
+    write_buffer = append_buffer( write_buffer, extensions,
+      extensions_length );
+  }
 
   assert( ( ( char * ) write_buffer - send_buffer ) == send_buffer_size );
 
@@ -1888,53 +1969,42 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   return 0;
 }
 
+/**
+ * Send this side's certificate chain. reference: reads cert.der (one
+ * certificate, length in a short). A client without credentials sends an
+ * empty list, which TLS allows.
+ */
 static int send_certificate( int connection, TLSParameters *parameters )
 {
-  short send_buffer_size;
-  unsigned char *send_buffer, *read_buffer;
-  int certificate_file;
-  struct stat certificate_stat;
-  short cert_len;
+  int send_buffer_size, i, list_length = 0;
+  unsigned char *send_buffer, *write_ptr;
 
-  if ( ( certificate_file = open( "cert.der", O_RDONLY ) ) == -1 )
+  if ( !have_credentials( parameters->connection_end ) &&
+       parameters->connection_end == connection_end_server )
   {
-    perror( "unable to load certificate file" );
+    fprintf( stderr, "No server certificate and key configured\n" );
     return 1;
   }
 
-  if ( fstat( certificate_file, &certificate_stat ) == -1 )
+  for ( i = 0; i < local_credentials.chain_length; i++ )
   {
-    perror( "unable to stat certificate file" );
-    return 1;
+    list_length += 3 + local_credentials.certificate_lengths[ i ];
   }
+  send_buffer_size = 3 + list_length;
+  write_ptr = send_buffer = ( unsigned char * ) malloc( send_buffer_size );
 
-  // Allocate enough space for the certificate file, plus 2 3-byte length
-  // entries.
-  send_buffer_size = certificate_stat.st_size + 6;
-  send_buffer = ( unsigned char * ) malloc( send_buffer_size );
-  memset( send_buffer, '\0', send_buffer_size );
-  cert_len = certificate_stat.st_size + 3;
-  cert_len = htons( cert_len );
-  memcpy( ( void * ) ( send_buffer + 1 ), &cert_len, 2 );
-  cert_len = certificate_stat.st_size;
-  cert_len = htons( cert_len );
-  memcpy( ( void * ) ( send_buffer + 4 ), &cert_len, 2 );
-
-  read_buffer = send_buffer + 6;
-  cert_len = certificate_stat.st_size;
-
-  while ( ( read_buffer - send_buffer ) < send_buffer_size )
+  // 24-bit lengths: the list, then each certificate
+  *write_ptr++ = ( list_length >> 16 ) & 0xFF;
+  *write_ptr++ = ( list_length >> 8 ) & 0xFF;
+  *write_ptr++ = list_length & 0xFF;
+  for ( i = 0; i < local_credentials.chain_length; i++ )
   {
-    int read_size;
-    read_size = read( certificate_file, read_buffer, cert_len );
-    read_buffer += read_size;
-    cert_len -= read_size;
-  }
-
-  if ( close( certificate_file ) == -1 )
-  {
-    perror( "unable to close certificate file" );
-    return 1;
+    int length = local_credentials.certificate_lengths[ i ];
+    *write_ptr++ = ( length >> 16 ) & 0xFF;
+    *write_ptr++ = ( length >> 8 ) & 0xFF;
+    *write_ptr++ = length & 0xFF;
+    memcpy( write_ptr, local_credentials.certificates[ i ], length );
+    write_ptr += length;
   }
 
   send_handshake_message( connection, certificate, send_buffer,
@@ -1953,52 +2023,85 @@ static int send_server_hello_done( int connection, TLSParameters *parameters )
 }
 
 /**
- * By the time this is called, "read_pos" points at an RSA encrypted (unless
- * RSA isn't used for key exchange) premaster secret. All this routine has to
- * do is decrypt it. See "privkey.c" for details.
- * TODO expand this to support Diffie-Hellman key exchange
+ * By the time this is called, "read_pos" points at an RSA encrypted
+ * premaster secret, or (ECDHE) the client's public point. reference: RSA only,
+ * re-reading key.pkcs8 for every handshake.
  */
 static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
                                                  int pdu_length,
                                                  TLSParameters *parameters )
 {
   int premaster_secret_length;
-  unsigned char *buffer;
-  int buffer_length;
-  unsigned char *premaster_secret;
-  rsa_key private_key;
+  unsigned char *premaster_secret = NULL;
 
-  // TODO make this configurable
-  // XXX this really really should be buffered
-  if ( !( buffer = load_file_into_memory( "key.pkcs8", &buffer_length ) ) )
+  if ( is_ecdhe_suite( parameters->pending_send_parameters.suite ) )
   {
-    perror( "Unable to load file" );
-    return 0;
+    // ClientECDiffieHellmanPublic: a length byte, then an X9.62 point
+    elliptic_curve *curve = &parameters->server_ecdh_params;
+    int coordinate_length = curve->p.size;
+    point K;
+
+    if ( pdu_length != 2 + coordinate_length * 2 ||
+         read_pos[ 0 ] != 1 + coordinate_length * 2 ||
+         read_pos[ 1 ] != uncompressed )
+    {
+      fprintf( stderr, "Malformed ECDH client key exchange\n" );
+      return NULL;
+    }
+    set_huge( &K.x, 0 );
+    set_huge( &K.y, 0 );
+    load_huge( &K.x, read_pos + 2, coordinate_length );
+    load_huge( &K.y, read_pos + 2 + coordinate_length, coordinate_length );
+    multiply_point( &K, &parameters->server_ecdh_secret, &curve->a,
+      &curve->p );
+    contract( &K.x );
+
+    premaster_secret_length = coordinate_length;
+    premaster_secret = malloc( premaster_secret_length );
+    memset( premaster_secret, '\0', premaster_secret_length );
+    memcpy( premaster_secret + coordinate_length - K.x.size, K.x.rep,
+      K.x.size );
+    free_huge( &K.x );
+    free_huge( &K.y );
   }
-
-  parse_pkcs8_private_key( &private_key, buffer, buffer_length, "password" );
-  free( buffer );
-
-  // Skip over the two length bytes, since length is already known anyway
-  premaster_secret_length = rsa_decrypt( read_pos + 2, pdu_length - 2,
-    &premaster_secret, &private_key );
-
-  if ( premaster_secret_length <= 0 )
+  else
   {
-    fprintf( stderr, "Unable to decrypt premaster secret.\n" );
-    return NULL;
-  }
+    unsigned char *decrypted = NULL;
+    int decrypted_length;
 
-  free_huge( private_key.modulus );
-  free_huge( private_key.exponent );
-  free( private_key.modulus );
-  free( private_key.exponent );
+    if ( !have_credentials( connection_end_server ) )
+    {
+      return NULL;
+    }
+
+    // Skip over the two length bytes, since length is already known anyway
+    decrypted_length = rsa_decrypt( read_pos + 2, pdu_length - 2,
+      &decrypted, &local_credentials.private_key );
+
+    // RFC 5246 7.4.7.1. A bad padding, length or version
+    // must not be distinguishable from a good one (Bleichenbacher's
+    // attack), so carry on with a random premaster secret and let the
+    // Finished messages fail.
+    premaster_secret_length = MASTER_SECRET_LENGTH;
+    premaster_secret = malloc( MASTER_SECRET_LENGTH );
+    random_bytes( premaster_secret, MASTER_SECRET_LENGTH );
+    if ( decrypted_length == MASTER_SECRET_LENGTH &&
+         decrypted[ 0 ] == TLS_VERSION_MAJOR &&
+         decrypted[ 1 ] == parameters->client_version )
+    {
+      memcpy( premaster_secret, decrypted, MASTER_SECRET_LENGTH );
+    }
+    if ( decrypted_length > 0 )
+    {
+      free( decrypted );
+    }
+  }
 
   // Now use the premaster secret to compute the master secret. Don't forget
-  // that the first two bytes of the premaster secret are the version 0x03 0x01
-  // These are part of the premaster secret (8.1.1 states that the premaster
-  // secret for RSA is exactly 48 bytes long).
-  compute_master_secret( premaster_secret, MASTER_SECRET_LENGTH, parameters );
+  // that the first two bytes of the RSA premaster secret are the version
+  // (8.1.1 states that the premaster secret for RSA is exactly 48 bytes).
+  compute_master_secret( premaster_secret, premaster_secret_length,
+    parameters );
 
   calculate_keys( parameters );
 
@@ -2185,6 +2288,118 @@ static int verify_signature( unsigned char *message,
   free( sha_digest.hash );
 
   return verified;
+}
+
+// DER DigestInfo header for a SHA-256 hash (RFC 3447 9.2)
+static const unsigned char sha256_digest_info_prefix[] = { 0x30, 0x31, 0x30,
+  0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+  0x05, 0x00, 0x04, 0x20 };
+
+/**
+ * Build a "digitally-signed" structure over client random + server random
+ * + params with this side's RSA key: TLS 1.2 signs a SHA-256 DigestInfo
+ * and prefixes the algorithm pair; earlier versions sign MD5 || SHA-1.
+ * Returns the length of *signed_struct.
+ */
+static int sign_params( TLSParameters *parameters,
+                        unsigned char *params,
+                        int params_length,
+                        unsigned char **signed_struct )
+{
+  unsigned char to_sign[ sizeof( sha256_digest_info_prefix ) +
+                         SHA256_BYTE_SIZE ];
+  int to_sign_length, header_length = 0, signature_length;
+  unsigned char *signature, *write_ptr;
+  digest_ctx digest;
+
+  if ( parameters->version >= TLS_1_2 )
+  {
+    hash_signed_params( sha256, params, params_length, parameters, &digest );
+    memcpy( to_sign, sha256_digest_info_prefix,
+      sizeof( sha256_digest_info_prefix ) );
+    memcpy( to_sign + sizeof( sha256_digest_info_prefix ), digest.hash,
+      SHA256_BYTE_SIZE );
+    to_sign_length = sizeof( to_sign );
+    header_length = 2;
+    free( digest.hash );
+  }
+  else
+  {
+    hash_signed_params( md5, params, params_length, parameters, &digest );
+    memcpy( to_sign, digest.hash, MD5_BYTE_SIZE );
+    free( digest.hash );
+    hash_signed_params( sha1, params, params_length, parameters, &digest );
+    memcpy( to_sign + MD5_BYTE_SIZE, digest.hash, SHA1_BYTE_SIZE );
+    free( digest.hash );
+    to_sign_length = MD5_BYTE_SIZE + SHA1_BYTE_SIZE;
+  }
+
+  signature_length = rsa_sign( to_sign, to_sign_length, &signature,
+    &local_credentials.private_key );
+
+  write_ptr = *signed_struct = malloc( header_length + 2 + signature_length );
+  if ( header_length )
+  {
+    *write_ptr++ = sha256;
+    *write_ptr++ = sig_rsa;
+  }
+  *write_ptr++ = ( signature_length >> 8 ) & 0xFF;
+  *write_ptr++ = signature_length & 0xFF;
+  memcpy( write_ptr, signature, signature_length );
+  free( signature );
+
+  return header_length + 2 + signature_length;
+}
+
+/**
+ * (its server only does RSA key exchange): pick an
+ * ephemeral P-256 key and send it, signed, in a ServerKeyExchange.
+ */
+static int send_server_key_exchange( int connection,
+                                     TLSParameters *parameters )
+{
+  elliptic_curve *curve = &parameters->server_ecdh_params;
+  point Q;
+  int coordinate_length, params_length, signed_length;
+  unsigned char *message, *signed_struct;
+
+  get_named_curve( "prime256v1", curve );
+  coordinate_length = curve->p.size;
+  random_huge_below( &parameters->server_ecdh_secret, &curve->n );
+
+  set_huge( &Q.x, 0 );
+  set_huge( &Q.y, 0 );
+  copy_huge( &Q.x, &curve->G.x );
+  copy_huge( &Q.y, &curve->G.y );
+  multiply_point( &Q, &parameters->server_ecdh_secret, &curve->a, &curve->p );
+  contract( &Q.x );
+  contract( &Q.y );
+
+  // ECParameters (named_curve, secp256r1) + ECPoint
+  params_length = 4 + 1 + coordinate_length * 2;
+  message = malloc( params_length );
+  memset( message, '\0', params_length );
+  message[ 0 ] = named;
+  message[ 1 ] = 0;
+  message[ 2 ] = secp256r1;
+  message[ 3 ] = 1 + coordinate_length * 2;
+  message[ 4 ] = uncompressed;
+  memcpy( message + 5 + coordinate_length - Q.x.size, Q.x.rep, Q.x.size );
+  memcpy( message + 5 + coordinate_length * 2 - Q.y.size, Q.y.rep, Q.y.size );
+  free_huge( &Q.x );
+  free_huge( &Q.y );
+
+  signed_length = sign_params( parameters, message, params_length,
+    &signed_struct );
+  message = realloc( message, params_length + signed_length );
+  memcpy( message + params_length, signed_struct, signed_length );
+  free( signed_struct );
+
+  send_handshake_message( connection, server_key_exchange, message,
+    params_length + signed_length, parameters );
+  free( message );
+
+  return 0;
 }
 
 static char *parse_server_key_exchange( unsigned char *read_pos,
@@ -3018,14 +3233,12 @@ static int send_certificate_verify( int connection,
   header_len = 2;
   }
 
-  if ( !( buffer = load_file_into_memory( "key.der", &buffer_length ) ) )
+  if ( !have_credentials( connection_end_client ) )
   {
-    perror( "Unable to load file" );
-    return 0;
+    // An empty certificate was sent; there's nothing to verify
+    return 1;
   }
-
-  parse_private_key( &private_key, buffer, buffer_length );
-  free( buffer );
+  private_key = local_credentials.private_key;
 
   handshake_signature_len = ( unsigned short ) rsa_sign( signed_data,
     signed_data_len, &handshake_signature, &private_key );
@@ -3222,6 +3435,14 @@ int tls_accept( int connection,
   }
 
   if ( send_certificate( connection, parameters ) )
+  {
+    send_alert_message( connection, handshake_failure,
+      &parameters->active_send_parameters );
+    return 3;
+  }
+
+  if ( is_ecdhe_suite( parameters->pending_send_parameters.suite ) &&
+       send_server_key_exchange( connection, parameters ) )
   {
     send_alert_message( connection, handshake_failure,
       &parameters->active_send_parameters );

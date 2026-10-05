@@ -308,6 +308,17 @@ int main( int argc, char *argv[ ] )
     {
       session_id_length = hex_decode( argv[ ++ind ], &session_id );
     }
+    else if ( !strcmp( "-cert", argv[ ind ] ) && ind + 2 < argc )
+    {
+      // client certificate and key, for servers that ask for one
+      if ( tls_set_credentials( argv[ ind + 1 ], argv[ ind + 2 ], NULL ) )
+      {
+        fprintf( stderr, "Unable to load %s / %s\n", argv[ ind + 1 ],
+          argv[ ind + 2 ] );
+        return 1;
+      }
+      ind += 2;
+    }
     else if ( !strcmp( "-k", argv[ ind ] ) )
     {
       // don't verify the server certificate
