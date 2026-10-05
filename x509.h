@@ -93,6 +93,8 @@ int parse_x509_certificate( const unsigned char *buffer,
                             const unsigned int certificate_length,
                             signed_x509_certificate *parsed_certificate );
 void free_x509_certificate( signed_x509_certificate *certificate );
+struct asn1struct;
+int parse_name( name *target, struct asn1struct *source );
 char *parse_x509_chain( unsigned char *buffer,
                         int pdu_length,
                         public_key_info *server_public_key );

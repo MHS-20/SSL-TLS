@@ -110,6 +110,9 @@ ProtectionParameters;
 #define MASTER_SECRET_LENGTH 48
 typedef unsigned char master_secret_type[ MASTER_SECRET_LENGTH ];
 
+#define MAX_SESSION_ID_LENGTH 32
+#define VERIFY_DATA_LEN 12
+
 #define RANDOM_LENGTH 32
 typedef unsigned char random_type[ RANDOM_LENGTH ];
 
@@ -137,12 +140,23 @@ typedef struct
 
   // Internal state
   int got_client_hello;
+  int got_server_hello;
   int server_hello_done;
   int peer_finished;
+  int got_certificate_request;
   digest_ctx md5_handshake_digest;
   digest_ctx sha1_handshake_digest;
   char *unread_buffer;
   int unread_length;
+
+  // Session resumption
+  int session_id_length;
+  unsigned char session_id[ MAX_SESSION_ID_LENGTH ];
+
+  // Secure renegotiation, RFC 5746
+  int support_secure_renegotiation;
+  unsigned char client_verify_data[ VERIFY_DATA_LEN ];
+  unsigned char server_verify_data[ VERIFY_DATA_LEN ];
 }
 TLSParameters;
 
@@ -280,7 +294,25 @@ ServerHello;
  * @return 1 if successful, 0 if not.
  */
 int tls_connect( int connection,
-                 TLSParameters *parameters );
+                 TLSParameters *parameters,
+                 int renegotiate );
+
+/**
+ * Resume a previously negotiated session.
+ */
+int tls_resume( int connection,
+                int session_id_length,
+                const unsigned char *session_id,
+                const unsigned char *master_secret,
+                TLSParameters *parameters );
+
+/**
+ * Initialize the server-side session cache; call once at startup.
+ */
+void init_tls();
+
+/** Test hook: the single cipher suite the client hello offers. */
+void tls_set_client_cipher_suite( unsigned short suite );
 
 /**
  * Wait for a client hello and negotiate a TLS channel as the server

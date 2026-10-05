@@ -18,9 +18,7 @@ void hmac( const unsigned char *key,
   digest_ctx hash1;
   int i;
 
-  // TODO if key_length > hash_block_length, should hash it using
-  // "hash_function" first and then use that as the key.
-  assert( key_length < DIGEST_BLOCK_SIZE );
+  unsigned char *hashed_key = NULL;
 
   // "cheating"; copy the supplied digest context in here, since we don't
   // know which digest algorithm is being used
@@ -28,6 +26,20 @@ void hmac( const unsigned char *key,
   hash1.hash = ( unsigned int * ) malloc(
     hash1.hash_len * sizeof( unsigned int ) );
   memcpy( hash1.hash, digest->hash, hash1.hash_len * sizeof( unsigned int ) );
+
+  if ( key_length > DIGEST_BLOCK_SIZE )
+  {
+    digest_ctx key_hash;
+    memcpy( &key_hash, &hash1, sizeof( digest_ctx ) );
+    key_hash.hash = ( unsigned int * ) malloc(
+      key_hash.hash_len * sizeof( unsigned int ) );
+    memcpy( key_hash.hash, digest->hash, key_hash.hash_len * sizeof( unsigned int ) );
+    update_digest( &key_hash, key, key_length );
+    finalize_digest( &key_hash );
+    key_length = key_hash.hash_len * sizeof( int );
+    hashed_key = ( unsigned char * ) key_hash.hash;
+    key = hashed_key;
+  }
 
   memset( ipad, 0x36, DIGEST_BLOCK_SIZE );
 
@@ -53,6 +65,10 @@ void hmac( const unsigned char *key,
   finalize_digest( digest );
 
   free( hash1.hash );
+  if ( hashed_key )
+  {
+    free( hashed_key );
+  }
 }
 
 #ifdef TEST_HMAC

@@ -134,7 +134,7 @@ static char *copy_value( struct asn1struct *value )
  * an OID and a value. If the OID is recognized, copy its contents
  * to the correct spot in "target". Otherwise, ignore it.
  */
-static int parse_name( name *target, struct asn1struct *source )
+int parse_name( name *target, struct asn1struct *source )
 {
   struct asn1struct *typeValuePair;
   struct asn1struct *typeValuePairSequence;
@@ -593,7 +593,22 @@ char *parse_x509_chain( unsigned char *buffer,
             certificate.tbsCertificate.subjectPublicKeyInfo.
             rsa_public_key.exponent );
           break;
+        case dsa:
+          set_huge( &server_public_key->dsa_parameters.g, 0 );
+          set_huge( &server_public_key->dsa_parameters.p, 0 );
+          set_huge( &server_public_key->dsa_parameters.q, 0 );
+          set_huge( &server_public_key->dsa_public_key, 0 );
+          copy_huge( &server_public_key->dsa_parameters.g,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.dsa_parameters.g );
+          copy_huge( &server_public_key->dsa_parameters.p,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.dsa_parameters.p );
+          copy_huge( &server_public_key->dsa_parameters.q,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.dsa_parameters.q );
+          copy_huge( &server_public_key->dsa_public_key,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.dsa_public_key );
+          break;
         default:
+          // Diffie-Hellman certificates not supported in this implementation
           break;
       }
     }

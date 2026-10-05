@@ -20,6 +20,7 @@
 #include "rsa.h"
 #include "privkey.h"
 #include "file.h"
+#include "asn1.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -133,22 +134,35 @@ static void init_protection_parameters( ProtectionParameters *parameters )
   parameters->suite = TLS_NULL_WITH_NULL_NULL;
 }
 
-static void init_parameters( TLSParameters *parameters )
+static void init_parameters( TLSParameters *parameters,
+                             int renegotiate )
 {
   init_protection_parameters( &parameters->pending_send_parameters );
   init_protection_parameters( &parameters->pending_recv_parameters );
-  init_protection_parameters( &parameters->active_send_parameters );
-  init_protection_parameters( &parameters->active_recv_parameters );
+
+  if ( !renegotiate )
+  {
+    init_protection_parameters( &parameters->active_send_parameters );
+    init_protection_parameters( &parameters->active_recv_parameters );
+
+    // Always assume secure renegotiation to begin
+    parameters->support_secure_renegotiation = 1;
+    memset( parameters->client_verify_data, '\0', VERIFY_DATA_LEN );
+    memset( parameters->server_verify_data, '\0', VERIFY_DATA_LEN );
+  }
 
   memset( parameters->master_secret, '\0', MASTER_SECRET_LENGTH );
   memset( parameters->client_random, '\0', RANDOM_LENGTH );
   memset( parameters->server_random, '\0', RANDOM_LENGTH );
   // Internal state
   parameters->got_client_hello = 0;
+  parameters->got_server_hello = 0;
   parameters->server_hello_done = 0;
   parameters->peer_finished = 0;
+  parameters->got_certificate_request = 0;
   parameters->unread_buffer = NULL;
   parameters->unread_length = 0;
+  parameters->session_id_length = 0;
 }
 
 /**
@@ -330,13 +344,112 @@ static int send_alert_message( int connection,
   return send_message( connection, content_alert, buffer, 2, parameters );
 }
 
+// lets the test client offer a different single suite
+static unsigned short client_cipher_suite = TLS_RSA_WITH_AES_128_CBC_SHA;
+
+void tls_set_client_cipher_suite( unsigned short suite )
+{
+  client_cipher_suite = suite;
+}
+
+typedef enum
+{
+  server_name = 0,
+  secure_renegotiation = 0xFF01
+}
+ExtensionType;
+
+static unsigned short add_renegotiation_extension(
+                            unsigned char **renegotiation_extension,
+                            int renegotiating,
+                            TLSParameters *parameters )
+{
+  unsigned char *write_ptr;
+  unsigned char data_length;
+  unsigned short renegotiation_length;
+
+  if ( renegotiating )
+  {
+    renegotiation_length =
+      ( parameters->connection_end == connection_end_client ?
+        VERIFY_DATA_LEN : ( VERIFY_DATA_LEN * 2 ) );
+    write_ptr = *renegotiation_extension = ( unsigned char * ) malloc(
+      renegotiation_length + 1 );
+    data_length = renegotiation_length;
+    write_ptr = append_buffer( write_ptr, ( void * ) &data_length,
+      sizeof( unsigned char ) );
+    // client_verify_data and server_verify_data are adjacent in TLSParameters
+    write_ptr = append_buffer( write_ptr,
+      parameters->client_verify_data, renegotiation_length );
+    return renegotiation_length + 1;
+  }
+  else
+  {
+    renegotiation_length = 1;
+    write_ptr = *renegotiation_extension = ( unsigned char * ) malloc(
+      renegotiation_length );
+    // On an initial handshake client_verify_data is all zeros, so this
+    // writes the single length byte 0
+    write_ptr = append_buffer( write_ptr,
+      parameters->client_verify_data, renegotiation_length );
+    return 1;
+  }
+}
+
+static unsigned short add_client_hello_extensions( unsigned char **extensions,
+                                                   TLSParameters *parameters,
+                                                   int renegotiating )
+{
+  unsigned char *write_ptr;
+  unsigned short extensions_length;
+  unsigned short extension_type;
+  unsigned char *renegotiation_extension;
+  unsigned short renegotiation_extension_length;
+
+  extensions_length = 0;
+
+  if ( parameters->support_secure_renegotiation )
+  {
+    renegotiation_extension_length =
+      add_renegotiation_extension( &renegotiation_extension,
+        renegotiating, parameters );
+    extensions_length += renegotiation_extension_length +
+      sizeof( unsigned short ) + 2;
+  }
+
+  if ( extensions_length )
+  {
+    write_ptr = *extensions = ( unsigned char * ) malloc(
+      extensions_length );
+    memset( *extensions, '\0', extensions_length );
+
+    // Insert the renegotiation extension
+    extension_type = htons( secure_renegotiation );
+    write_ptr = append_buffer( write_ptr, ( void * ) &extension_type,
+      sizeof( unsigned short ) );
+    renegotiation_extension_length = htons( renegotiation_extension_length );
+    write_ptr = append_buffer( write_ptr,
+      ( void *) &renegotiation_extension_length,
+      sizeof( unsigned short ) );
+    write_ptr = append_buffer( write_ptr, renegotiation_extension,
+      ntohs( renegotiation_extension_length ) );
+    free( renegotiation_extension );
+  }
+
+  return extensions_length;
+}
+
 /**
  * Build and submit a TLS client hello handshake on the active
  * connection. It is up to the caller of this function to wait
  * for the server reply.
  */
-static int send_client_hello( int connection, TLSParameters *parameters )
+static int send_client_hello( int connection,
+                              TLSParameters *parameters,
+                              int renegotiating )
 {
+  unsigned char *extensions;
+  unsigned short extensions_length;
   ClientHello package;
   unsigned short supported_suites[ 1 ];
   unsigned char supported_compression_methods[ 1 ];
@@ -355,11 +468,19 @@ static int send_client_hello( int connection, TLSParameters *parameters )
   // "client random" are the GMT unix time computed above.
   memcpy( parameters->client_random, &package.random.gmt_unix_time, 4 );
   memcpy( package.random.random_bytes, parameters->client_random + 4, 28 );
-  package.session_id_length = 0;
-  package.session_id = NULL;
+  if ( parameters->session_id_length > 0 )
+  {
+    package.session_id_length = parameters->session_id_length;
+    package.session_id = parameters->session_id;
+  }
+  else
+  {
+    package.session_id_length = 0;
+    package.session_id = NULL;
+  }
   // note that this is bytes, not count.
   package.cipher_suites_length = htons( 2 );
-  supported_suites[ 0 ] = htons( TLS_RSA_WITH_AES_128_CBC_SHA );
+  supported_suites[ 0 ] = htons( client_cipher_suite );
   package.cipher_suites = supported_suites;
   package.compression_methods_length = 1;
   supported_compression_methods[ 0 ] = 0;
@@ -374,6 +495,13 @@ static int send_client_hello( int connection, TLSParameters *parameters )
     ( sizeof( unsigned short ) * 1 ) +
     sizeof( unsigned char ) +
     sizeof( unsigned char );
+
+  extensions_length = add_client_hello_extensions( &extensions,
+    parameters, renegotiating );
+  if ( extensions_length )
+  {
+    send_buffer_size += extensions_length + sizeof( unsigned short );
+  }
 
   write_buffer = send_buffer = ( char * ) malloc( send_buffer_size );
 
@@ -405,6 +533,16 @@ static int send_client_hello( int connection, TLSParameters *parameters )
       ( void * ) package.compression_methods, 1 );
   }
 
+  if ( extensions_length )
+  {
+    extensions_length = htons( extensions_length );
+    write_buffer = append_buffer( write_buffer, ( void * ) &extensions_length,
+      2 );
+    write_buffer = append_buffer( write_buffer, ( void * ) extensions,
+      ntohs( extensions_length ) );
+    free( extensions );
+  }
+
   assert( ( ( char * ) write_buffer - send_buffer ) == send_buffer_size );
 
   status = send_handshake_message( connection, client_hello, send_buffer,
@@ -415,11 +553,67 @@ static int send_client_hello( int connection, TLSParameters *parameters )
   return status;
 }
 
+/**
+ * Compare the server renegotiation data with the stored
+ * verify data. If this is the first negotiation attempt,
+ * this data should be set to 0.
+ */
+static int parse_renegotiation_info( const char *read_pos,
+                                     const int extension_length,
+                                     TLSParameters *parameters )
+{
+  return !( memcmp( parameters->client_verify_data, read_pos + 1,
+    extension_length - 1 ) );
+}
+
+static char *parse_server_hello_extensions( char *read_pos,
+                                            int extensions_length,
+                                            TLSParameters *parameters )
+{
+  unsigned short advertised_extensions_length;
+  unsigned short extension_type;
+  unsigned short extension_length;
+
+  parameters->support_secure_renegotiation = 0;
+
+  read_pos = read_buffer( ( void * ) &advertised_extensions_length,
+    read_pos, sizeof( unsigned short ) );
+  advertised_extensions_length = ntohs( advertised_extensions_length );
+  extensions_length -= 2;
+
+  assert( advertised_extensions_length == extensions_length );
+
+  while ( extensions_length )
+  {
+    read_pos = read_buffer( ( void * ) &extension_type, read_pos,
+      sizeof( unsigned short ) );
+    read_pos = read_buffer( ( void * ) &extension_length, read_pos,
+      sizeof( unsigned short ) );
+    extensions_length -= 4;
+    extension_type = ntohs( extension_type );
+    extension_length = ntohs( extension_length );
+    if ( extension_type == secure_renegotiation )
+    {
+      parameters->support_secure_renegotiation = 1;
+      if ( !parse_renegotiation_info( read_pos, extension_length, parameters ) )
+      {
+        return NULL;
+      }
+    }
+    read_pos += extension_length;
+    extensions_length -= extension_length;
+  }
+
+  return read_pos;
+}
+
 static char *parse_server_hello( char *read_pos,
                                  int pdu_length,
                                  TLSParameters *parameters )
 {
   ServerHello hello;
+  int extensions_length;
+  char *server_hello_begin = read_pos;
 
   read_pos = read_buffer( ( void * ) &hello.server_version.major,
     ( void * ) read_pos, 1 );
@@ -452,9 +646,19 @@ static char *parse_server_hello( char *read_pos,
     return NULL;
   }
 
-  // TODO - abort if there's more data here than in the spec (per section
-  // 7.4.1.2, forward compatibility note)
   // TODO - abort if version < 3.1 with "protocol_version" alert error
+
+  extensions_length = pdu_length - ( read_pos - server_hello_begin );
+  if ( extensions_length )
+  {
+    read_pos = parse_server_hello_extensions( read_pos, extensions_length,
+      parameters );
+    // Abort the handshake if the extensions didn't parse.
+    if ( read_pos == NULL )
+    {
+      return NULL;
+    }
+  }
 
   // 28 random bytes, but the preceding four bytes are the reported GMT unix
   // time
@@ -462,6 +666,10 @@ static char *parse_server_hello( char *read_pos,
     &hello.random.gmt_unix_time, 4 );
   memcpy( ( void * ) ( parameters->server_random + 4 ),
     ( void * ) hello.random.random_bytes, 28 );
+
+  parameters->session_id_length = hello.session_id_length;
+  memcpy( parameters->session_id, hello.session_id, hello.session_id_length );
+  parameters->got_server_hello = 1;
 
   return read_pos;
 }
@@ -618,6 +826,7 @@ int rsa_key_exchange( rsa_key *public_key,
  */
 int dh_key_exchange( dh_key *server_dh_key,
                      unsigned char *premaster_secret,
+                     int *premaster_secret_len,
                      unsigned char **key_exchange_message )
 {
   huge Yc;
@@ -633,6 +842,8 @@ int dh_key_exchange( dh_key *server_dh_key,
 
   // Now copy Z into premaster secret and Yc into key_exchange_message
   memcpy( premaster_secret, Z.rep, Z.size );
+  // RFC 2246 8.1.2 leading zero bytes of Z are stripped, so report Z.size
+  *premaster_secret_len = Z.size;
   message_size = Yc.size + 2;
   transmit_len = htons( Yc.size );
   *key_exchange_message = malloc( message_size );
@@ -710,7 +921,7 @@ static int send_client_key_exchange( int connection, TLSParameters *parameters )
       premaster_secret_len = parameters->server_dh_key.p.size;
       premaster_secret = malloc( premaster_secret_len );
       key_exchange_message_len = dh_key_exchange( &parameters->server_dh_key,
-        premaster_secret, &key_exchange_message );
+        premaster_secret, &premaster_secret_len, &key_exchange_message );
       break;
     default:
       return 0;
@@ -801,7 +1012,6 @@ void compute_handshake_hash( TLSParameters *parameters,
  * ServerHello.random );
  * always 48 bytes in length.
  */
-#define VERIFY_DATA_LEN 12
 
 static void compute_verify_data( const char *finished_label,
                                  TLSParameters *parameters,
@@ -830,6 +1040,12 @@ static int send_finished( int connection,
     parameters->connection_end == connection_end_client ?
       "client finished" : "server finished",
     parameters, verify_data );
+
+  // Record the verify data for later secure renegotiation
+  memcpy( parameters->connection_end == connection_end_client ?
+    parameters->client_verify_data : parameters->server_verify_data,
+    verify_data, VERIFY_DATA_LEN );
+
   send_handshake_message( connection, finished, verify_data, VERIFY_DATA_LEN,
     parameters );
 
@@ -849,6 +1065,11 @@ static unsigned char *parse_finished( unsigned char *read_pos,
     "server finished" : "client finished",
     parameters, verify_data );
 
+  // Record the verify data for later secure renegotiation
+  memcpy( parameters->connection_end == connection_end_client ?
+    parameters->server_verify_data : parameters->client_verify_data,
+    verify_data, VERIFY_DATA_LEN );
+
   if ( memcmp( read_pos, verify_data, VERIFY_DATA_LEN ) )
   {
     return NULL;
@@ -858,12 +1079,191 @@ static unsigned char *parse_finished( unsigned char *read_pos,
 }
 
 
+typedef enum
+{
+  host_name = 0
+}
+NameType;
+
+static void parse_server_name_extension( unsigned char *data,
+                                         unsigned short data_len,
+                                         TLSParameters *parameters )
+{
+  unsigned short server_name_list_len;
+  unsigned char name_type;
+  unsigned char *data_start;
+
+  data = read_buffer( ( void * ) &server_name_list_len, ( void * ) data, 2 );
+  server_name_list_len = ntohs( server_name_list_len );
+  data_start = data;
+
+  data = read_buffer( ( void * ) &name_type, ( void * ) data, 1 );
+
+  switch ( name_type )
+  {
+    case host_name:
+      {
+        unsigned short host_name_len;
+        unsigned char *host_name;
+        data = read_buffer( ( void * ) &host_name_len,
+          ( void * ) data, 2 );
+        host_name_len = ntohs( host_name_len );
+        host_name = malloc( host_name_len + 1 );
+        data = read_buffer( ( void * ) host_name,
+          ( void * ) data, host_name_len );
+        host_name[ host_name_len ] = '\0';
+        printf( "got host name '%s'\n", host_name );
+        // TODO store this and use it to select a certificate
+        // TODO return an "unrecognized_name" alert if the host name
+        // is unknown
+        free( host_name );
+      }
+      break;
+    default:
+      // nothing else defined by the spec
+      break;
+  }
+}
+
+static char *parse_client_hello_extensions( char *read_pos,
+                                            TLSParameters *parameters )
+{
+  unsigned short extensions_size, extension_data_size;
+  char *init_pos;
+  unsigned short type;
+
+  read_pos = read_buffer( ( void * ) &extensions_size, ( void * ) read_pos, 2 );
+  extensions_size = ntohs( extensions_size );
+  init_pos = read_pos;
+
+  while ( ( read_pos - init_pos ) < extensions_size )
+  {
+    read_pos = read_buffer( ( void * ) &type, ( void * ) read_pos, 2 );
+    read_pos = read_buffer( ( void * ) &extension_data_size,
+      ( void * ) read_pos, 2 );
+    type = ntohs( type );
+    extension_data_size = ntohs( extension_data_size );
+    switch ( type )
+    {
+      case server_name:
+        parse_server_name_extension( read_pos, extension_data_size,
+          parameters );
+        printf( "Got server name extension\n" );
+        break;
+      default:
+        printf( "warning, skipping unsupported client hello extension %d\n",
+          type );
+        break;
+    }
+    read_pos += extension_data_size;
+  }
+
+  return read_pos;
+}
+
+#define HASH_TABLE_SIZE 100
+
+typedef struct StoredSessionsList_t
+{
+  int session_id_length;
+  unsigned char session_id[ MAX_SESSION_ID_LENGTH ];
+  unsigned char master_secret[ MASTER_SECRET_LENGTH ];
+  struct StoredSessionsList_t *next;
+}
+StoredSessionsList;
+
+static StoredSessionsList *stored_sessions[ HASH_TABLE_SIZE ];
+
+void init_tls()
+{
+  int i = 0;
+  for ( i = 0; i < HASH_TABLE_SIZE; i++ )
+  {
+    stored_sessions[ i ] = NULL;
+  }
+}
+
+/**
+ * Store the session in the stored sessions cache
+ */
+static void remember_session( TLSParameters *parameters )
+{
+  if ( parameters->session_id_length > 0 )
+  {
+    int session_id;
+    StoredSessionsList *head;
+    memcpy( &session_id, parameters->session_id, sizeof( int ) );
+    head = stored_sessions[ session_id % HASH_TABLE_SIZE ];
+    if ( head == NULL )
+    {
+      head = stored_sessions[ session_id % HASH_TABLE_SIZE ] =
+        malloc( sizeof( StoredSessionsList ) );
+    }
+    else
+    {
+      while ( head->next != NULL )
+      {
+        head = ( StoredSessionsList * ) head->next;
+      }
+      head->next = malloc( sizeof( StoredSessionsList ) );
+      head = ( StoredSessionsList * ) head->next;
+    }
+
+    head->session_id_length = parameters->session_id_length;
+    memcpy( head->session_id, &session_id, head->session_id_length );
+    memcpy( head->master_secret, parameters->master_secret,
+      MASTER_SECRET_LENGTH );
+    head->next = NULL;
+  }
+}
+
+/**
+ * Check to see if the requested session ID is stored in the local cache.
+ * If the session ID is recognized, parameters will be updated to include
+ * it, and the master secret will be stored in the parameters.
+ * If it is not recognized, the session
+ * ID in the parameters will be left empty, indicating that a new handshake
+ * should commence.
+ */
+static void find_stored_session( int session_id_length,
+                                 const unsigned char *session_id,
+                                 TLSParameters *parameters )
+{
+  int session_id_num;
+  StoredSessionsList *head;
+
+  if ( session_id_length > sizeof( int ) )
+  {
+    // Definitely didn't come from this server.
+    return;
+  }
+
+  memcpy( &session_id_num, session_id, session_id_length );
+
+  for ( head = stored_sessions[ session_id_num % HASH_TABLE_SIZE ];
+        head != NULL;
+        head = ( StoredSessionsList * ) head->next )
+  {
+    if ( !memcmp( session_id, head->session_id, session_id_length ) )
+    {
+      parameters->session_id_length = session_id_length;
+      memcpy( parameters->session_id, head->session_id, session_id_length );
+      memcpy( parameters->master_secret, head->master_secret,
+        MASTER_SECRET_LENGTH );
+      break;
+    }
+  }
+}
+
 static char *parse_client_hello( char *read_pos,
                                  int pdu_length,
                                  TLSParameters *parameters )
 {
   int i;
   ClientHello hello;
+  char *init_pos;
+
+  init_pos = read_pos; // keep track of start to check for extensions
 
   read_pos = read_buffer( ( void * ) &hello.client_version.major,
     ( void * ) read_pos, 1 );
@@ -926,13 +1326,28 @@ static char *parse_client_hello( char *read_pos,
 
   free( hello.cipher_suites );
   free( hello.compression_methods );
+
+  if ( hello.session_id_length > 0 )
+  {
+    find_stored_session( hello.session_id_length, hello.session_id,
+      parameters );
+  }
+
   if ( hello.session_id )
   {
     free( hello.session_id );
   }
 
+  // Parse client hello extensions
+  if ( ( read_pos - init_pos ) < pdu_length )
+  {
+    read_pos = parse_client_hello_extensions( read_pos, parameters );
+  }
+
   return read_pos;
 }
+
+static int next_session_id = 1;
 
 static int send_server_hello( int connection, TLSParameters *parameters )
 {
@@ -951,7 +1366,16 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   // "server random" are the GMT unix time computed above.
   memcpy( parameters->server_random, &package.random.gmt_unix_time, 4 );
   memcpy( package.random.random_bytes, parameters->server_random + 4, 28 );
-  package.session_id_length = 0;
+  if ( parameters->session_id_length == 0 )
+  {
+    // Assign a new session ID
+    memcpy( parameters->session_id, &next_session_id, sizeof( int ) );
+    parameters->session_id_length = sizeof( int );
+    next_session_id++;
+  }
+  package.session_id_length = parameters->session_id_length;
+  memcpy( package.session_id, parameters->session_id,
+    parameters->session_id_length );
   package.cipher_suite = htons( parameters->pending_send_parameters.suite );
   package.compression_method = 0;
 
@@ -1111,6 +1535,196 @@ static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
   free( premaster_secret );
 
   return read_pos + pdu_length;
+}
+
+static int verify_signature( unsigned char *message,
+                             int message_len,
+                             unsigned char *signature,
+                             int signature_len,
+                             TLSParameters *parameters )
+{
+  // This is needed for RSA or DSA
+  digest_ctx sha1_digest;
+
+  new_sha1_digest( &sha1_digest );
+  update_digest( &sha1_digest, parameters->client_random, RANDOM_LENGTH );
+  update_digest( &sha1_digest, parameters->server_random, RANDOM_LENGTH );
+  update_digest( &sha1_digest, message, message_len );
+  finalize_digest( &sha1_digest );
+
+  if ( parameters->server_public_key.algorithm == rsa )
+  {
+    unsigned char *decrypted_signature;
+    int decrypted_signature_length;
+    digest_ctx md5_digest;
+
+    decrypted_signature_length = rsa_decrypt( signature, signature_len,
+      &decrypted_signature,
+      &parameters->server_public_key.rsa_public_key );
+
+    // If the signature algorithm is RSA, this will be the md5 hash, followed by
+    // the sha-1 hash of: client random, server random, params).
+    // If DSA, this will just be the sha-1 hash
+    new_md5_digest( &md5_digest );
+    update_digest( &md5_digest, parameters->client_random, RANDOM_LENGTH );
+    update_digest( &md5_digest, parameters->server_random, RANDOM_LENGTH );
+    update_digest( &md5_digest, message, message_len );
+    finalize_digest( &md5_digest );
+
+    if ( decrypted_signature_length < 0 ||
+         memcmp( md5_digest.hash, decrypted_signature, MD5_BYTE_SIZE ) ||
+         memcmp( sha1_digest.hash, decrypted_signature + MD5_BYTE_SIZE,
+                 SHA1_BYTE_SIZE ) )
+    {
+      return 0;
+    }
+
+    free( decrypted_signature );
+  }
+  else if ( parameters->server_public_key.algorithm == dsa )
+  {
+    struct asn1struct decoded_signature;
+    dsa_signature received_signature;
+
+    asn1parse( signature, signature_len, &decoded_signature );
+
+    set_huge( &received_signature.r, 0 );
+    set_huge( &received_signature.s, 0 );
+    load_huge( &received_signature.r, decoded_signature.children->data,
+      decoded_signature.children->length );
+    load_huge( &received_signature.s,
+      decoded_signature.children->next->data,
+      decoded_signature.children->next->length );
+
+    asn1free( &decoded_signature );
+
+    if ( !dsa_verify( &parameters->server_public_key.dsa_parameters,
+                      &parameters->server_public_key.dsa_public_key,
+                      sha1_digest.hash,
+                      SHA1_BYTE_SIZE,
+                      &received_signature ) )
+    {
+      free_huge( &received_signature.r );
+      free_huge( &received_signature.s );
+      return 0;
+    }
+
+    free_huge( &received_signature.r );
+    free_huge( &received_signature.s );
+  }
+
+  return 1;
+}
+
+static char *parse_server_key_exchange( unsigned char *read_pos,
+                                        int pdu_length,
+                                        TLSParameters *parameters )
+{
+  short length;
+  int i;
+  unsigned char *dh_params = read_pos;
+
+  for ( i = 0; i < 4; i++ )
+  {
+    if ( i == 3 && ( read_pos - dh_params ) >= pdu_length )
+    {
+      break;
+    }
+    memcpy( &length, read_pos, 2 );
+    length = ntohs( length );
+    read_pos += 2;
+
+    switch ( i )
+    {
+      case 0:
+        load_huge( &parameters->server_dh_key.p, read_pos, length );
+        break;
+      case 1:
+        load_huge( &parameters->server_dh_key.g, read_pos, length );
+        break;
+      case 2:
+        load_huge( &parameters->server_dh_key.Y, read_pos, length );
+        break;
+      case 3:
+        // The third element is the signature over the first three, including their
+        // length bytes
+        if ( !verify_signature( dh_params,
+              ( read_pos - 2 - dh_params ),
+              read_pos, length, parameters ) )
+        {
+          return NULL;
+        }
+        break;
+    }
+    read_pos += length;
+  }
+
+  return read_pos;
+}
+
+#define MAX_CERTIFICATE_TYPES 4
+
+typedef enum
+{
+  rsa_signed = 1,
+  dss_signed = 2,
+  rsa_fixed_dh = 3,
+  dss_fixed_dh = 4
+}
+certificate_type;
+
+typedef struct
+{
+  unsigned char certificate_types_count;
+  certificate_type supported_certificate_types[ MAX_CERTIFICATE_TYPES ];
+}
+CertificateRequest;
+
+static unsigned char *parse_certificate_request( unsigned char *read_pos,
+                                                 TLSParameters *parameters )
+{
+  int i;
+  unsigned short trusted_roots_length;
+  unsigned char *init_pos;
+  CertificateRequest request;
+
+  read_pos = read_buffer( &request.certificate_types_count, read_pos, 1 );
+  for ( i = 0; i < request.certificate_types_count; i++ )
+  {
+    unsigned char type;
+    read_pos = read_buffer( ( void * ) &type, read_pos, 1 );
+    if ( i < MAX_CERTIFICATE_TYPES )
+    {
+      request.supported_certificate_types[ i ] = type;
+    }
+  }
+
+  read_pos = read_buffer( ( void * ) &trusted_roots_length, read_pos, 2 );
+  trusted_roots_length = htons( trusted_roots_length );
+  init_pos = read_pos;
+  while ( ( read_pos - init_pos ) < trusted_roots_length )
+  {
+    unsigned short dn_length;
+    struct asn1struct dn_data;
+    name dn;
+
+    read_pos = read_buffer( ( void * ) &dn_length, read_pos, 2 );
+    dn_length = htons( dn_length );
+
+    asn1parse( read_pos, dn_length, &dn_data );
+    // the DN is a SEQUENCE of SETs; parse_name walks its children
+    parse_name( &dn, &dn_data );
+    printf( "Server trusts issuer: C=%s/ST=%s/L=%s/O=%s/OU=%s/CN=%s\n",
+      dn.idAtCountryName, dn.idAtStateOrProvinceName,
+      dn.idAtLocalityName, dn.idAtOrganizationName,
+      dn.idAtOrganizationalUnitName, dn.idAtCommonName );
+    asn1free( &dn_data );
+    read_pos += dn_length;
+  }
+
+  parameters->got_certificate_request = 1;
+
+  return read_pos;
 }
 
 static void report_alert( Alert *alert )
@@ -1456,8 +2070,48 @@ static int receive_tls_msg( int connection,
             return -1;
           }
           break;
+        case server_key_exchange:
+          read_pos = parse_server_key_exchange( read_pos, handshake.length,
+            parameters );
+          if ( read_pos == NULL )
+          {
+            send_alert_message( connection, handshake_failure,
+              &parameters->active_send_parameters );
+            return -1;
+          }
+          break;
+        case certificate_request: // Abort if server requests a certificate?
+          read_pos = parse_certificate_request( read_pos, parameters );
+          break;
         case server_hello_done:
           parameters->server_hello_done = 1;
+          break;
+        case hello_request: // Tell the client to start again from the beginning
+          // No data in the hello request, nothing to parse
+          if ( parameters->connection_end != connection_end_client )
+          {
+            // This shouldn't be sent to a server, and it shouldn't
+            // be sent until the first negotiation is complete.
+            send_alert_message( connection, unexpected_message,
+              &parameters->active_send_parameters );
+            return -1;
+          }
+          // Per the spec, this isn't an error, just ignore if
+          // currently negotiating
+          if ( parameters->peer_finished )
+          {
+            // recursive, but the check for peer_finished above
+            // prevents infinite recursion.
+            // the hello request must not enter the new
+            // handshake's digest, and this record's data is consumed here
+            free( decrypted_message );
+            tls_connect( connection, parameters, 1 );
+            return 0;
+          }
+          else
+          {
+            read_pos += handshake.length;
+          }
           break;
         case finished:
           {
@@ -1559,19 +2213,70 @@ static int receive_tls_msg( int connection,
   return decrypted_length;
 }
 
+static int send_certificate_verify( int connection,
+                                    TLSParameters *parameters )
+{
+  unsigned char *buffer;
+  int buffer_length;
+  rsa_key private_key;
+  unsigned short handshake_signature_len;
+  unsigned char *handshake_signature;
+  unsigned short certificate_verify_message_len;
+  unsigned char *certificate_verify_message;
+  unsigned char handshake_hash[ ( MD5_RESULT_SIZE * sizeof( int ) ) +
+                                ( SHA1_RESULT_SIZE * sizeof( int ) ) ];
+
+  compute_handshake_hash( parameters, handshake_hash );
+
+  if ( !( buffer = load_file_into_memory( "key.der", &buffer_length ) ) )
+  {
+    perror( "Unable to load file" );
+    return 0;
+  }
+
+  parse_private_key( &private_key, buffer, buffer_length );
+  free( buffer );
+
+  handshake_signature_len = ( unsigned short ) rsa_sign( handshake_hash,
+    MD5_BYTE_SIZE + SHA1_BYTE_SIZE, &handshake_signature,
+    &private_key );
+
+  certificate_verify_message_len = handshake_signature_len +
+    sizeof( unsigned short );
+  certificate_verify_message = ( unsigned char * )
+    malloc( certificate_verify_message_len );
+
+  // copying this "backwards" so that I can use the signature len
+  // as a numeric input but then htons it to send on.
+  memcpy( ( void * ) ( certificate_verify_message + 2 ),
+    ( void * ) handshake_signature, handshake_signature_len );
+  handshake_signature_len = htons( handshake_signature_len );
+  memcpy( ( void * ) certificate_verify_message,
+    ( void * ) &handshake_signature_len, sizeof( unsigned short ) );
+
+  send_handshake_message( connection, certificate_verify,
+    certificate_verify_message, certificate_verify_message_len, parameters );
+
+  free( certificate_verify_message );
+  free( handshake_signature );
+
+  return 1;
+}
+
 /**
  * Negotiate TLS parameters on an already-established socket.
  */
 int tls_connect( int connection,
-                 TLSParameters *parameters )
+                 TLSParameters *parameters,
+                 int renegotiate )
 {
-  init_parameters( parameters );
+  init_parameters( parameters, renegotiate );
   parameters->connection_end = connection_end_client;
   new_md5_digest( &parameters->md5_handshake_digest );
   new_sha1_digest( &parameters->sha1_handshake_digest );
 
   // Step 1. Send the TLS handshake "client hello" message
-  if ( send_client_hello( connection, parameters ) < 0 )
+  if ( send_client_hello( connection, parameters, renegotiate ) < 0 )
   {
     perror( "Unable to send client hello" );
     return 1;
@@ -1580,6 +2285,7 @@ int tls_connect( int connection,
   // Step 2. Receive the server hello response (will also have gotten
   // the server certificate along the way)
   parameters->server_hello_done = 0;
+  parameters->got_certificate_request = 0;
   while ( !parameters->server_hello_done )
   {
     if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
@@ -1589,12 +2295,28 @@ int tls_connect( int connection,
     }
   }
 
+  // Certificate precedes key exchange
+  if ( parameters->got_certificate_request )
+  {
+    send_certificate( connection, parameters );
+  }
+
   // Step 3. Send client key exchange, change cipher spec (7.1) and encrypted
   // handshake message
   if ( !( send_client_key_exchange( connection, parameters ) ) )
   {
     perror( "Unable to send client key exchange" );
     return 3;
+  }
+
+  // Certificate verify comes after key exchange
+  if ( parameters->got_certificate_request )
+  {
+    if ( !send_certificate_verify( connection, parameters ) )
+    {
+      perror( "Unable to send certificate verify message" );
+      return 3;
+    }
   }
 
   if ( !( send_change_cipher_spec( connection, parameters ) ) )
@@ -1626,7 +2348,7 @@ int tls_connect( int connection,
 int tls_accept( int connection,
                 TLSParameters *parameters )
 {
-  init_parameters( parameters );
+  init_parameters( parameters, 0 );
   parameters->connection_end = connection_end_server;
 
   new_md5_digest( &parameters->md5_handshake_digest );
@@ -1643,6 +2365,56 @@ int tls_accept( int connection,
         &parameters->active_send_parameters );
       return 1;
     }
+  }
+
+  if ( parameters->session_id_length > 0 )
+  {
+    // Client asked for a resumption, and this server recognized the
+    // session id. Shortened handshake here. "parse_client_hello"
+    // will have already initiated calculate keys.
+    if ( send_server_hello( connection, parameters ) )
+    {
+      send_alert_message( connection, handshake_failure,
+        &parameters->active_send_parameters );
+      return 3;
+    }
+
+    // Can't calculate keys until this point because server random
+    // is needed.
+    calculate_keys( parameters );
+
+    // send server change cipher spec/finished message
+    // Order is reversed when resuming
+    if ( !( send_change_cipher_spec( connection, parameters ) ) )
+    {
+      perror( "Unable to send client change cipher spec" );
+      send_alert_message( connection, handshake_failure,
+        &parameters->active_send_parameters );
+      return 7;
+    }
+
+    // This message will be encrypted using the newly negotiated keys
+    if ( !( send_finished( connection, parameters ) ) )
+    {
+      perror( "Unable to send client finished" );
+      send_alert_message( connection, handshake_failure,
+        &parameters->active_send_parameters );
+      return 8;
+    }
+
+    parameters->peer_finished = 0;
+    while ( !parameters->peer_finished )
+    {
+      if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
+      {
+        perror( "Unable to receive client finished" );
+        send_alert_message( connection, handshake_failure,
+          &parameters->active_send_parameters );
+        return 6;
+      }
+    }
+
+    return 0;
   }
 
   if ( send_server_hello( connection, parameters ) )
@@ -1699,6 +2471,79 @@ int tls_accept( int connection,
   }
 
   // Handshake is complete; now ready to start sending encrypted data
+  // IFF the handshake was successful, put it into the sesion ID cache
+  // list for reuse.
+  remember_session( parameters );
+
+  return 0;
+}
+
+int tls_resume( int connection,
+                int session_id_length,
+                const unsigned char *session_id,
+                const unsigned char *master_secret,
+                TLSParameters *parameters )
+{
+  int keys_calculated = 0;
+
+  init_parameters( parameters, 0 );
+  parameters->connection_end = connection_end_client;
+  parameters->session_id_length = session_id_length;
+  memcpy( &parameters->session_id, session_id, session_id_length );
+
+  new_md5_digest( &parameters->md5_handshake_digest );
+  new_sha1_digest( &parameters->sha1_handshake_digest );
+
+  // Send the TLS handshake "client hello" message
+  if ( send_client_hello( connection, parameters, 0 ) < 0 )
+  {
+    perror( "Unable to send client hello" );
+    return 1;
+  }
+
+  // Receive server hello, change cipher spec & finished.
+  parameters->server_hello_done = 0;
+  parameters->peer_finished = 0;
+  while ( !parameters->peer_finished )
+  {
+    if ( receive_tls_msg( connection, NULL, 0, parameters ) < 0 )
+    {
+      perror( "Unable to receive server finished" );
+      return 6;
+    }
+
+    if ( parameters->got_server_hello && !keys_calculated )
+    {
+      // Check to see if the server agreed to resume; if not,
+      // abort, even though the server is probably willing to continue
+      // with a new session.
+      if ( memcmp( session_id, &parameters->session_id, session_id_length ) )
+      {
+        printf( "Server refused to renegotiate, exiting.\n" );
+        return 7;
+      }
+      else
+      {
+        memcpy( parameters->master_secret, master_secret,
+          MASTER_SECRET_LENGTH );
+        calculate_keys( parameters );
+        keys_calculated = 1;
+      }
+    }
+  }
+
+  if ( !( send_change_cipher_spec( connection, parameters ) ) )
+  {
+    perror( "Unable to send client change cipher spec" );
+    return 4;
+  }
+
+  if ( !( send_finished( connection, parameters ) ) )
+  {
+    perror( "Unable to send client finished" );
+    return 5;
+  }
+
   return 0;
 }
 

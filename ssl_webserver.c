@@ -142,6 +142,8 @@ int main( int argc, char *argv[ ] )
   }
 #endif
 
+  init_tls();
+
   if ( ( listen_sock = socket( PF_INET, SOCK_STREAM, 0 ) ) == -1 )
   {
     perror( "Unable to create listening socket" );

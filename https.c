@@ -17,6 +17,7 @@
 #endif
 #include "base64.h"
 #include "tls.h"
+#include "hex.h"
 
 #define HTTP_PORT 80
 #define HTTPS_PORT 443
@@ -185,6 +186,10 @@ int main( int argc, char *argv[ ] )
   int ind;
   int port = HTTPS_PORT;
   TLSParameters tls_context;
+  int master_secret_length;
+  unsigned char *master_secret;
+  int session_id_length;
+  unsigned char *session_id;
 #ifdef WIN32
   WSADATA wsaData;
 #endif
@@ -198,18 +203,40 @@ int main( int argc, char *argv[ ] )
     return 1;
   }
 
-  proxy_host = proxy_user = proxy_password = host = path = NULL;
-  ind = 1;
-  if ( !strcmp( "-p", argv[ ind ] ) )
+  proxy_host = proxy_user = proxy_password = host = path =
+    session_id = master_secret = NULL;
+  session_id_length = master_secret_length = 0;
+
+  for ( ind = 1; ind < ( argc - 1 ); ind++ )
   {
-    if ( !parse_proxy_param( argv[ ++ind ], &proxy_host, &proxy_port,
-                             &proxy_user, &proxy_password ) )
+    if ( !strcmp( "-p", argv[ ind ] ) )
     {
-      fprintf( stderr, "Error - malformed proxy parameter '%s'.\n",
-        argv[ 2 ] );
-      return 2;
+      if ( !parse_proxy_param( argv[ ++ind ], &proxy_host, &proxy_port,
+                               &proxy_user, &proxy_password ) )
+      {
+        fprintf( stderr, "Error - malformed proxy parameter '%s'.\n", argv[ 2 ] );
+        return 2;
+      }
     }
-    ind++;
+    else if ( !strcmp( "-s", argv[ ind ] ) )
+    {
+      session_id_length = hex_decode( argv[ ++ind ], &session_id );
+    }
+    else if ( !strcmp( "-c", argv[ ind ] ) )
+    {
+      tls_set_client_cipher_suite( strtol( argv[ ++ind ], NULL, 16 ) );
+    }
+    else if ( !strcmp( "-m", argv[ ind ] ) )
+    {
+      master_secret_length = hex_decode( argv[ ++ind ], &master_secret );
+    }
+  }
+
+  if ( ( ( master_secret_length > 0 ) && ( session_id_length == 0 ) ) ||
+       ( ( master_secret_length == 0 ) && ( session_id_length > 0 ) ) )
+  {
+    fprintf( stderr, "session id and master secret must both be provided.\n" );
+    return 3;
   }
 
   if ( parse_url( argv[ ind ], &host, &path ) == -1 )
@@ -276,10 +303,27 @@ int main( int argc, char *argv[ ] )
 
   printf( "Connection complete; negotiating TLS parameters\n" );
 
-  if ( tls_connect( client_connection, &tls_context ) )
+  if ( session_id != NULL )
   {
-    fprintf( stderr, "Error: unable to negotiate TLS connection.\n" );
-    return 3;
+    if ( tls_resume( client_connection, session_id_length,
+         session_id, master_secret, &tls_context ) )
+    {
+      fprintf( stderr, "Error: unable to negotiate SSL connection.\n" );
+      if ( close( client_connection ) == -1 )
+      {
+        perror( "Error closing client connection" );
+        return 2;
+      }
+      return 3;
+    }
+  }
+  else
+  {
+    if ( tls_connect( client_connection, &tls_context, 0 ) )
+    {
+      fprintf( stderr, "Error: unable to negotiate TLS connection.\n" );
+      return 3;
+    }
   }
 
   printf( "Retrieving document: '%s'\n", path );
@@ -289,6 +333,20 @@ int main( int argc, char *argv[ ] )
   display_result( client_connection, &tls_context );
 
   tls_shutdown( client_connection, &tls_context );
+
+  printf( "Session ID was: " );
+  show_hex( tls_context.session_id, tls_context.session_id_length );
+  printf( "Master secret was: " );
+  show_hex( tls_context.master_secret, MASTER_SECRET_LENGTH );
+
+  if ( session_id != NULL )
+  {
+    free( session_id );
+  }
+  if ( master_secret != NULL )
+  {
+    free( master_secret );
+  }
 
   printf( "Shutting down.\n" );
 

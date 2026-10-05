@@ -23,10 +23,11 @@ void rsa_compute( huge *m, huge *e, huge *n, huge *c )
  *
  * returns the length of the data encrypted in output
  */
-int rsa_encrypt( unsigned char *input,
+int rsa_process( unsigned char *input,
                  unsigned int len,
                  unsigned char **output,
-                 rsa_key *public_key )
+                 rsa_key *public_key,
+                 unsigned char block_type )
 {
   int i;
   huge c, m;
@@ -47,12 +48,19 @@ int rsa_encrypt( unsigned char *input,
     memcpy( padded_block + ( modulus_length - block_size ),
       input, block_size );
     // set block type
-    padded_block[ 1 ] = 0x02;
+    padded_block[ 1 ] = block_type;
 
     for ( i = 2; i < ( modulus_length - block_size - 1 ); i++ )
     {
-      // TODO make these random
-      padded_block[ i ] = i;
+      if ( block_type == 0x02 )
+      {
+        // TODO make these random
+        padded_block[ i ] = i;
+      }
+      else
+      {
+        padded_block[ i ] = 0xFF;
+      }
     }
 
     load_huge( &m, padded_block, modulus_length );
@@ -72,6 +80,22 @@ int rsa_encrypt( unsigned char *input,
   free( padded_block );
 
   return encrypted_size;
+}
+
+int rsa_encrypt( unsigned char *input,
+                 unsigned int len,
+                 unsigned char **output,
+                 rsa_key *public_key )
+{
+  return rsa_process( input, len, output, public_key, 0x02 );
+}
+
+int rsa_sign( unsigned char *input,
+              unsigned int len,
+              unsigned char **output,
+              rsa_key *private_key )
+{
+  return rsa_process( input, len, output, private_key, 0x01 );
 }
 
 /**
