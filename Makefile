@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -g -w
 LDLIBS = -lm
 
-TESTS = des_test aes_test rc4_test rsa_test digest_test hmac_test dsa_test ecdsa_test ecc_int_test
+TESTS = des_test aes_test rc4_test rsa_test digest_test hmac_test dsa_test ecdsa_test ecc_int_test asn1_test x509_test
 
 all: http webserver $(TESTS)
 
@@ -43,3 +43,9 @@ clean:
 	rm -f http webserver $(TESTS) *.o
 
 .PHONY: all clean
+
+asn1_test: asn1.c base64.c
+	$(CC) $(CFLAGS) -DTEST_ASN1 -o $@ $^
+
+x509_test: x509.c asn1.c base64.c rsa.c dsa.c huge.c digest.c md5.c sha.c hex.c
+	$(CC) $(CFLAGS) -DTEST_X509 -o $@ $^ $(LDLIBS)
