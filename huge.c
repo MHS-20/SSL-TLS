@@ -575,6 +575,7 @@ void inv( huge *z, huge *a )
     // force positive remainder always
     j.sign = 0;
     subtract( &j, a );
+    j.sign = 0;
   }
 
   while ( !( ( j.size == 1 ) && ( !j.rep[ 0 ] ) ) )
