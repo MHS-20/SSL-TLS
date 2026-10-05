@@ -81,10 +81,10 @@ client tls12-rsa-gcm           $B/https -C $WORK/cert.pem -V 1.2 -c 9c   -- -tls
 client tls12-dhe-rsa           $B/https -C $WORK/cert.pem -V 1.2 -c 33   -- -tls1_2 -cert cert.pem -key key.pem -cipher "DHE-RSA-AES128-SHA:$S0"
 client tls12-ecdhe-rsa         $B/https -C $WORK/cert.pem -V 1.2 -c c013 -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-SHA:$S0"
 client tls12-ecdhe-ecdsa       $B/https -C $WORK/ec-cert.pem -V 1.2 -c c009 -- -tls1_2 -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-SHA:$S0"
-CLIENT_DIR=client client tls12-ecdhe-rsa-gcm     $B/https -C $WORK/cert.pem -V 1.2 -c c02f -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-GCM-SHA256:$S0"
+client tls12-ecdhe-rsa-gcm     $B/https -C $WORK/cert.pem -V 1.2 -c c02f -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-GCM-SHA256:$S0"
 client tls12-ecdhe-ecdsa-gcm   $B/https -C $WORK/ec-cert.pem -V 1.2 -c c02b -- -tls1_2 -cert ec-cert.pem -key ec-key.pem -cipher "ECDHE-ECDSA-AES128-GCM-SHA256:$S0"
 client tls12-ecdhe-p384        $B/https -C $WORK/cert.pem -V 1.2 -c c02f -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-GCM-SHA256:$S0" -groups P-384
-client tls12-client-auth $B/https -C $WORK/cert.pem -V 1.2 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
+CLIENT_DIR=client client tls12-client-auth $B/https -C $WORK/cert.pem -V 1.2 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
   -cipher "AES128-SHA:$S0" -Verify 1 -CAfile root-cert.pem
 client reject-untrusted        $B/https -C $WORK/root-cert.pem -- -cert cert.pem -key key.pem -cipher "ALL:$S0"
 server tls10-server            $B/ssl_webserver   -- -tls1   -legacy_server_connect -cipher "AES128-SHA:$S0"
