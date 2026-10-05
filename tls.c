@@ -173,6 +173,8 @@ static void init_parameters( TLSParameters *parameters,
   parameters->session_id_length = 0;
   parameters->got_application_data = 0;
   parameters->peer_closed = 0;
+  parameters->handshake_pending = NULL;
+  parameters->handshake_pending_length = 0;
 }
 
 /**
@@ -2970,12 +2972,50 @@ static int receive_tls_msg( int connection,
 
   if ( message.type == content_handshake )
   {
+    // ("TODO - this fails if the read, above, only got part
+    // of the message"): a handshake message may span records. Prepend what
+    // was left over from the last record, and keep any incomplete tail.
+    if ( parameters->handshake_pending_length )
+    {
+      unsigned char *combined = malloc(
+        parameters->handshake_pending_length + decrypted_length );
+      memcpy( combined, parameters->handshake_pending,
+        parameters->handshake_pending_length );
+      memcpy( combined + parameters->handshake_pending_length,
+        decrypted_message, decrypted_length );
+      decrypted_length += parameters->handshake_pending_length;
+      free( decrypted_message );
+      free( parameters->handshake_pending );
+      parameters->handshake_pending = NULL;
+      parameters->handshake_pending_length = 0;
+      decrypted_message = combined;
+    }
+    read_pos = decrypted_message;
+
     while ( ( read_pos - decrypted_message ) < decrypted_length )
     {
       Handshake handshake;
+      int remaining = decrypted_length - ( read_pos - decrypted_message );
 
       // Keep track of beginning of message for handshake digest update below
       const unsigned char *handshake_msg_start = read_pos;
+
+      if ( remaining < 4 ||
+           remaining < 4 + ( read_pos[ 1 ] << 16 | read_pos[ 2 ] << 8 |
+                             read_pos[ 3 ] ) )
+      {
+        if ( remaining > ( 1 << 20 ) )
+        {
+          send_alert_message( connection, decode_error,
+            &parameters->active_send_parameters );
+          free( decrypted_message );
+          return -1;
+        }
+        parameters->handshake_pending = malloc( remaining );
+        memcpy( parameters->handshake_pending, read_pos, remaining );
+        parameters->handshake_pending_length = remaining;
+        break;
+      }
 
       // Now, read the handshake type and length of the next packet
       // TODO - this fails if the read, above, only got part of the message

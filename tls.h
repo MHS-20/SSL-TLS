@@ -206,6 +206,9 @@ typedef struct
   // application data, and whether the peer sent close_notify
   int got_application_data;
   int peer_closed;
+  // the start of a handshake message continued in the next record
+  unsigned char *handshake_pending;
+  int handshake_pending_length;
 
   // Session resumption
   int session_id_length;

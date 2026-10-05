@@ -88,6 +88,7 @@ client tls12-ecdhe-ecdsa-gcm   $B/https -C $WORK/ec-cert.pem -V 1.2 -c c02b -- -
 client tls12-ecdhe-p384        $B/https -C $WORK/cert.pem -V 1.2 -c c02f -- -tls1_2 -cert cert.pem -key key.pem -cipher "ECDHE-RSA-AES128-GCM-SHA256:$S0" -groups P-384
 CLIENT_DIR=client client tls12-client-auth $B/https -C $WORK/cert.pem -V 1.2 -c 2f -- -tls1_2 -cert cert.pem -key key.pem \
   -cipher "AES128-SHA:$S0" -Verify 1 -CAfile root-cert.pem
+client fragmented-handshake   $B/https -C $WORK/cert.pem -- -cert cert.pem -key key.pem -cipher "ALL:$S0" -max_send_frag 512
 client reject-untrusted        $B/https -C $WORK/root-cert.pem -- -cert cert.pem -key key.pem -cipher "ALL:$S0"
 server tls10-server            $B/ssl_webserver   -- -tls1   -cipher "AES128-SHA:$S0"
 server tls12-server-cbc        $B/ssl_webserver -- -tls1_2 -cipher "AES128-SHA:$S0"
