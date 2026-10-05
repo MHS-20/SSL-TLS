@@ -21,7 +21,7 @@ aes_test: aes.c hex.c
 rc4_test: rc4.c hex.c
 	$(CC) $(CFLAGS) -DTEST_RC4 -o $@ $^
 
-rsa_test: rsa.c huge.c hex.c
+rsa_test: rsa.c random.c huge.c hex.c
 	$(CC) $(CFLAGS) -DTEST_RSA -o $@ $^
 
 digest_test: digest.c md5.c sha.c hex.c
@@ -47,10 +47,10 @@ clean:
 asn1_test: asn1.c base64.c
 	$(CC) $(CFLAGS) -DTEST_ASN1 -o $@ $^
 
-x509_test: x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c hex.c
+x509_test: x509.c asn1.c base64.c random.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c hex.c
 	$(CC) $(CFLAGS) -DTEST_X509 -o $@ $^ $(LDLIBS)
 
-TLS_OBJS = tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c des.c aes.c rc4.c hex.c
+TLS_OBJS = random.c tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c des.c aes.c rc4.c hex.c
 
 https: https.c $(TLS_OBJS)
 	$(CC) $(CFLAGS) -O2 -o $@ $^ $(LDLIBS)
@@ -76,10 +76,16 @@ openssl_https: openssl_https.c
 	$(CC) $(CFLAGS) -o $@ $^ -lssl -lcrypto
 
 # Appendix C: SSLv2 client, and a replay of the original SSLv2 capture
-SSL2_OBJS = ssl.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c des.c rc4.c hex.c
+SSL2_OBJS = ssl.c random.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c des.c rc4.c hex.c
 
 ssl2_https: ssl2_https.c $(SSL2_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ssl2_test: $(SSL2_OBJS)
 	$(CC) $(CFLAGS) -DTEST_SSL2 -o $@ $^ $(LDLIBS)
+
+test: all
+	tests/unit.sh
+	tests/interop.sh
+
+.PHONY: test

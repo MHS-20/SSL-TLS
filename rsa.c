@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "rsa.h"
+#include "random.h"
 #include "hex.h"
 
 /**
@@ -50,14 +51,14 @@ int rsa_process( unsigned char *input,
     // set block type
     padded_block[ 1 ] = block_type;
 
-    for ( i = 2; i < ( modulus_length - block_size - 1 ); i++ )
+    if ( block_type == 0x02 )
     {
-      if ( block_type == 0x02 )
-      {
-        // TODO make these random
-        padded_block[ i ] = i;
-      }
-      else
+      random_nonzero_bytes( padded_block + 2,
+        modulus_length - block_size - 3 );
+    }
+    else
+    {
+      for ( i = 2; i < ( modulus_length - block_size - 1 ); i++ )
       {
         padded_block[ i ] = 0xFF;
       }

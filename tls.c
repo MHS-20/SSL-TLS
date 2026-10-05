@@ -23,6 +23,7 @@
 #include "asn1.h"
 #include "ecc.h"
 #include "ecdsa.h"
+#include "random.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -303,8 +304,7 @@ static int send_message( int connection,
     {
       if ( explicit_iv_len )
       {
-        // TODO make this random
-        memset( parameters->IV, '\0', explicit_iv_len );
+        random_bytes( parameters->IV, explicit_iv_len );
         memcpy( encrypted_buffer + 5, parameters->IV, explicit_iv_len );
       }
       active_suite->bulk_encrypt( send_buffer + 5, send_buffer_size - 5,
@@ -560,10 +560,10 @@ static int send_client_hello( int connection,
   package.client_version.minor = TLS_VERSION_MINOR;
   time( &local_time );
   package.random.gmt_unix_time = htonl( local_time );
-  // TODO - actually make this random.
   // This is 28 bytes, but client random is 32 - the first four bytes of
   // "client random" are the GMT unix time computed above.
   memcpy( parameters->client_random, &package.random.gmt_unix_time, 4 );
+  random_bytes( parameters->client_random + 4, 28 );
   memcpy( package.random.random_bytes, parameters->client_random + 4, 28 );
   if ( parameters->session_id_length > 0 )
   {
@@ -899,11 +899,7 @@ int rsa_key_exchange( rsa_key *public_key,
   // first two bytes are protocol version
   premaster_secret[ 0 ] = TLS_VERSION_MAJOR;
   premaster_secret[ 1 ] = TLS_VERSION_MINOR;
-  for ( i = 2; i < MASTER_SECRET_LENGTH; i++ )
-  {
-    // XXX SHOULD BE RANDOM!
-    premaster_secret[ i ] = i;
-  }
+  random_bytes( premaster_secret + 2, MASTER_SECRET_LENGTH - 2 );
 
   encrypted_length = rsa_encrypt( premaster_secret, MASTER_SECRET_LENGTH,
     &encrypted_premaster_secret, public_key );
@@ -934,8 +930,10 @@ int dh_key_exchange( dh_key *server_dh_key,
   int message_size;
   short transmit_len;
 
-  // TODO obviously, make this random, and much longer
-  set_huge( &a, 6 );
+  unsigned char exponent[ 32 ];
+
+  random_bytes( exponent, sizeof( exponent ) );
+  load_huge( &a, exponent, sizeof( exponent ) );
   mod_pow( &server_dh_key->g, &a, &server_dh_key->p, &Yc );
   mod_pow( &server_dh_key->Y, &a, &server_dh_key->p, &Z );
 
@@ -970,7 +968,7 @@ int ecdh_key_exchange( point *server_ecdh_key,
   point K;
   int coordinate_length = curve->p.size;
 
-  set_huge( &A.d, 4 ); // TODO this should be random, and larger
+  random_huge_below( &A.d, &curve->n );
   set_huge( &A.Q.x, 0 );
   set_huge( &A.Q.y, 0 );
   copy_huge( &A.Q.x, &curve->G.x );
@@ -1461,6 +1459,7 @@ static void remember_session( TLSParameters *parameters )
     int session_id;
     StoredSessionsList *head;
     memcpy( &session_id, parameters->session_id, sizeof( int ) );
+    session_id &= 0x7FFFFFFF;
     head = stored_sessions[ session_id % HASH_TABLE_SIZE ];
     if ( head == NULL )
     {
@@ -1478,7 +1477,8 @@ static void remember_session( TLSParameters *parameters )
     }
 
     head->session_id_length = parameters->session_id_length;
-    memcpy( head->session_id, &session_id, head->session_id_length );
+    memcpy( head->session_id, parameters->session_id,
+      head->session_id_length );
     memcpy( head->master_secret, parameters->master_secret,
       MASTER_SECRET_LENGTH );
     head->next = NULL;
@@ -1500,19 +1500,22 @@ static void find_stored_session( int session_id_length,
   int session_id_num;
   StoredSessionsList *head;
 
-  if ( session_id_length > sizeof( int ) )
+  if ( session_id_length != MAX_SESSION_ID_LENGTH )
   {
     // Definitely didn't come from this server.
     return;
   }
 
-  memcpy( &session_id_num, session_id, session_id_length );
+  // The first four bytes are random, so they serve as the hash
+  memcpy( &session_id_num, session_id, sizeof( int ) );
+  session_id_num &= 0x7FFFFFFF;
 
   for ( head = stored_sessions[ session_id_num % HASH_TABLE_SIZE ];
         head != NULL;
         head = ( StoredSessionsList * ) head->next )
   {
-    if ( !memcmp( session_id, head->session_id, session_id_length ) )
+    if ( head->session_id_length == session_id_length &&
+         !memcmp( session_id, head->session_id, session_id_length ) )
     {
       parameters->session_id_length = session_id_length;
       memcpy( parameters->session_id, head->session_id, session_id_length );
@@ -1651,17 +1654,16 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   package.server_version.minor = TLS_VERSION_MINOR;
   time( &local_time );
   package.random.gmt_unix_time = htonl( local_time );
-  // TODO - actually make this random.
   // This is 28 bytes, but server random is 32 - the first four bytes of
   // "server random" are the GMT unix time computed above.
   memcpy( parameters->server_random, &package.random.gmt_unix_time, 4 );
+  random_bytes( parameters->server_random + 4, 28 );
   memcpy( package.random.random_bytes, parameters->server_random + 4, 28 );
   if ( parameters->session_id_length == 0 )
   {
     // Assign a new session ID
-    memcpy( parameters->session_id, &next_session_id, sizeof( int ) );
-    parameters->session_id_length = sizeof( int );
-    next_session_id++;
+    random_bytes( parameters->session_id, MAX_SESSION_ID_LENGTH );
+    parameters->session_id_length = MAX_SESSION_ID_LENGTH;
   }
   package.session_id_length = parameters->session_id_length;
   memcpy( package.session_id, parameters->session_id,

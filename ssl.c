@@ -11,6 +11,11 @@
 #include "des.h"
 #include "rc4.h"
 #include "hex.h"
+#include "random.h"
+
+// The replay test in main() needs the original fixed challenge, master key
+// and IVs; everything else gets random ones.
+static int deterministic = 0;
 
 #define NUM_CIPHER_SPECS 3
 
@@ -61,8 +66,11 @@ static void init_parameters( SSLParameters *parameters )
 
   for ( i = 0; i < CHALLENGE_LEN; i++ )
   {
-    // XXX this should be random
     parameters->challenge[ i ] = i;
+  }
+  if ( !deterministic )
+  {
+    random_bytes( parameters->challenge, CHALLENGE_LEN );
   }
 
   parameters->master_key = NULL;
@@ -623,8 +631,12 @@ static void compute_keys( SSLParameters *parameters )
 
   for ( i = 0; i < parameters->proposed_cipher_spec->key_size; i++ )
   {
-    // XXX should be random
     parameters->master_key[ i ] = i;
+  }
+  if ( !deterministic )
+  {
+    random_bytes( parameters->master_key,
+      parameters->proposed_cipher_spec->key_size );
   }
 
 // Technically wrong per the 1995 draft specification, but removed to
@@ -688,12 +700,18 @@ static void compute_keys( SSLParameters *parameters )
       parameters->proposed_cipher_spec->IV_size );
     parameters->write_iv = malloc(
       parameters->proposed_cipher_spec->IV_size );
+    // OpenSSL expects a single IV that both directions start from
     for ( i = 0; i < parameters->proposed_cipher_spec->IV_size; i++ )
     {
-      // XXX these should be random
       parameters->read_iv[ i ] = i;
-      parameters->write_iv[ i ] = i;
     }
+    if ( !deterministic )
+    {
+      random_bytes( parameters->read_iv,
+        parameters->proposed_cipher_spec->IV_size );
+    }
+    memcpy( parameters->write_iv, parameters->read_iv,
+      parameters->proposed_cipher_spec->IV_size );
   }
 
   free( key_material );
@@ -898,6 +916,7 @@ int main( int argc, char *argv[ ] )
   unsigned char *connection_id;
 
   socketpair( AF_UNIX, SOCK_STREAM, 0, s );
+  deterministic = 1;
 
   init_parameters( &parameters );
   parameters.connection_id_len = hex_decode(
