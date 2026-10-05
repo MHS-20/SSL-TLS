@@ -4,7 +4,7 @@ LDLIBS = -lm
 
 TESTS = des_test aes_test rc4_test rsa_test digest_test hmac_test dsa_test ecdsa_test ecc_int_test asn1_test x509_test
 
-all: http webserver $(TESTS)
+all: http webserver https prf_test $(TESTS)
 
 http: http.c base64.c
 	$(CC) $(CFLAGS) -o $@ $^
@@ -49,3 +49,11 @@ asn1_test: asn1.c base64.c
 
 x509_test: x509.c asn1.c base64.c rsa.c dsa.c huge.c digest.c md5.c sha.c hex.c
 	$(CC) $(CFLAGS) -DTEST_X509 -o $@ $^ $(LDLIBS)
+
+TLS_OBJS = tls.c prf.c x509.c asn1.c base64.c rsa.c dsa.c dh.c huge.c hmac.c digest.c md5.c sha.c des.c aes.c rc4.c hex.c
+
+https: https.c $(TLS_OBJS)
+	$(CC) $(CFLAGS) -O2 -o $@ $^ $(LDLIBS)
+
+prf_test: prf.c hmac.c digest.c md5.c sha.c hex.c
+	$(CC) $(CFLAGS) -DTEST_PRF -o $@ $^ $(LDLIBS)

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <assert.h>
 #include "x509.h"
 #include "asn1.h"
 #include "md5.h"
@@ -525,6 +526,87 @@ int parse_x509_certificate( const unsigned char *buffer,
   asn1free( &certificate );
 
   return 0;
+}
+
+
+/**
+ * This is called by "receive_server_hello" when the "certificate" PDU
+ * is encountered. The input to this function should be a certificate chain.
+ * The most important certificate is the first one, since this contains the
+ * public key of the subject as well as the DNS name information (which
+ * has to be verified against).
+ * Each subsequent certificate acts as a signer for the previous certificate.
+ * Each signature is verified by this function.
+ * The public key of the first certificate in the chain will be returned in
+ * "server_public_key" (subsequent certificates are just needed for signature
+ * verification).
+ * TODO verify signatures.
+ */
+char *parse_x509_chain( unsigned char *buffer,
+                        int pdu_length,
+                        public_key_info *server_public_key )
+{
+  int pos;
+  signed_x509_certificate certificate;
+  unsigned int chain_length, certificate_length;
+  unsigned char *ptr;
+
+  ptr = buffer;
+
+  pos = 0;
+
+  // TODO this won't work on a big-endian machine
+  chain_length = ( *ptr << 16 ) | ( *( ptr + 1 ) << 8 ) | ( *( ptr + 2 ) );
+  ptr += 3;
+
+  // The chain length is actually redundant since the length of the PDU has
+  // already been input.
+  assert ( chain_length == ( pdu_length - 3 ) );
+
+  while ( ( ptr - buffer ) < pdu_length )
+  {
+    // TODO this won't work on a big-endian machine
+    certificate_length = ( *ptr << 16 ) | ( *( ptr + 1 ) << 8 ) |
+      ( *( ptr + 2 ) );
+    ptr += 3;
+
+    init_x509_certificate( &certificate );
+
+    parse_x509_certificate( ( void * ) ptr, certificate_length, &certificate );
+    if ( !pos++ )
+    {
+      server_public_key->algorithm =
+        certificate.tbsCertificate.subjectPublicKeyInfo.algorithm;
+      switch ( server_public_key->algorithm )
+      {
+        case rsa:
+          server_public_key->rsa_public_key.modulus =
+            ( huge * ) malloc( sizeof( huge ) );
+          server_public_key->rsa_public_key.exponent =
+            ( huge * ) malloc( sizeof( huge ) );
+          set_huge( server_public_key->rsa_public_key.modulus, 0 );
+          set_huge( server_public_key->rsa_public_key.exponent, 0 );
+          copy_huge( server_public_key->rsa_public_key.modulus,
+            certificate.tbsCertificate.subjectPublicKeyInfo.
+            rsa_public_key.modulus );
+          copy_huge( server_public_key->rsa_public_key.exponent,
+            certificate.tbsCertificate.subjectPublicKeyInfo.
+            rsa_public_key.exponent );
+          break;
+        default:
+          break;
+      }
+    }
+
+    ptr += certificate_length;
+
+    // TODO compute the hash of the certificate so that it can be validated by
+    // the next one
+
+    free_x509_certificate( &certificate );
+  }
+
+  return ptr;
 }
 
 #ifdef TEST_X509

@@ -1,4 +1,4 @@
-#include "huge.h"
+#include "dh.h"
 
 /**
  * Diffie-Hellman key agreement: Y = g^e % p (sent to the peer), then
