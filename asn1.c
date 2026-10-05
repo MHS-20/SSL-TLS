@@ -7,6 +7,12 @@
 #include "asn1.h"
 #include "base64.h"
 
+/**
+ * Parse DER into a tree of asn1struct nodes. Returns 0 on success, -1 if
+ * the encoding runs past the buffer; the tree is always safe to asn1free.
+ * the length checks, the high-tag-number loop advancing,
+ * and empty constructed values (which left an uninitialized child).
+ */
 int asn1parse( const unsigned char *buffer,
                int length,
                struct asn1struct *top_level_token )
@@ -17,14 +23,20 @@ int asn1parse( const unsigned char *buffer,
   const unsigned char *ptr;
   const unsigned char *ptr_begin;
   struct asn1struct *token;
+  int status = 0;
 
   ptr = buffer;
 
   token = top_level_token;
+  memset( token, 0, sizeof( struct asn1struct ) );
 
-  while ( length )
+  while ( length > 0 )
   {
     ptr_begin = ptr;
+    if ( length < 2 )
+    {
+      return -1;
+    }
     tag = *ptr;
     ptr++;
     length--;
@@ -33,14 +45,21 @@ int asn1parse( const unsigned char *buffer,
     // in X.509
     if ( ( tag & 0x1F ) == 0x1F )
     {
-      tag = 0;
-      while ( *ptr & 0x80 )
+      unsigned int high_tag = 0;
+      while ( length > 1 && ( *ptr & 0x80 ) )
       {
-        tag <<= 8;
-        tag |= *ptr & 0x7F;
+        high_tag = ( high_tag << 7 ) | ( *ptr++ & 0x7F );
+        length--;
       }
+      high_tag = ( high_tag << 7 ) | ( *ptr++ & 0x7F );
+      length--;
+      tag = ( tag & 0xE0 ) | ( high_tag & 0x1F );
     }
 
+    if ( length < 1 )
+    {
+      return -1;
+    }
     tag_length_byte = *ptr;
     ptr++;
     length--;
@@ -51,8 +70,14 @@ int asn1parse( const unsigned char *buffer,
     if ( tag_length_byte & 0x80 )
     {
       const unsigned char *len_ptr = ptr;
+      int length_bytes = tag_length_byte & 0x7F;
+
+      if ( length_bytes > 4 || length_bytes > length )
+      {
+        return -1;
+      }
       tag_length = 0;
-      while ( ( len_ptr - ptr ) < ( tag_length_byte & 0x7F ) )
+      while ( ( len_ptr - ptr ) < length_bytes )
       {
         tag_length <<= 8;
         tag_length |= *(len_ptr++);
@@ -65,7 +90,11 @@ int asn1parse( const unsigned char *buffer,
       tag_length = tag_length_byte;
     }
 
-    // TODO deal with "high tag numbers"
+    if ( tag_length > length )
+    {
+      return -1;
+    }
+
     token->constructed = tag & 0x20;
     token->tag_class = ( tag & 0xC0 ) >> 6;
     token->tag = tag & 0x1F;
@@ -81,9 +110,15 @@ int asn1parse( const unsigned char *buffer,
       token->data = ptr_begin;
 
       // Append a child to this tag and recurse into it
-      token->children = ( struct asn1struct * )
-        malloc( sizeof( struct asn1struct ) );
-      asn1parse( ptr, tag_length, token->children );
+      if ( tag_length )
+      {
+        token->children = ( struct asn1struct * )
+          malloc( sizeof( struct asn1struct ) );
+        if ( asn1parse( ptr, tag_length, token->children ) )
+        {
+          status = -1;
+        }
+      }
     }
 
     ptr += tag_length;
@@ -94,18 +129,14 @@ int asn1parse( const unsigned char *buffer,
     {
       token->next = ( struct asn1struct * )
         malloc( sizeof( struct asn1struct ) );
+      memset( token->next, 0, sizeof( struct asn1struct ) );
       token = token->next;
     }
   }
 
-  return 0;
+  return status;
 }
 
-/**
- * Recurse through the given node and free all of the memory that was allocated
- * by asn1parse. Don't free the "data" pointers, since that points to memory
- * that was not allocated by asn1parse.
- */
 void asn1free( struct asn1struct *node )
 {
   if ( !node )

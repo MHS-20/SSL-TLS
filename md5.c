@@ -161,4 +161,5 @@ void new_md5_digest( digest_ctx *context )
   memset( context->block, '\0', DIGEST_BLOCK_SIZE );
   context->block_operate = md5_block_operate;
   context->block_finalize = md5_finalize;
+  context->block_size = DIGEST_BLOCK_SIZE;
 }

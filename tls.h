@@ -80,7 +80,10 @@ typedef enum
   // ECDHE with an RSA-signed server key exchange
   TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013,
   TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014,
-  MAX_SUPPORTED_CIPHER_SUITE = 0xC015
+  // ECDHE with AES-GCM (RFC 5289), what most servers want
+  TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B,
+  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xC02F,
+  MAX_SUPPORTED_CIPHER_SUITE = 0xC030
 } CipherSuiteIdentifier;
 
 typedef struct
@@ -392,6 +395,15 @@ void tls_set_client_cipher_suite( unsigned short suite );
  * numbers (TLS_1_0 .. TLS_1_2). Applies to clients and servers.
  */
 void tls_set_version_range( int min_version, int max_version );
+
+/**
+ * Make clients verify the server's certificate chain against the roots in
+ * ca_file (a PEM bundle) and, if hostname isn't NULL, check that the leaf
+ * certificate names it; hostname is also sent as SNI. ca_file NULL turns
+ * verification off (the original behavior). Returns the number of roots
+ * loaded, or -1.
+ */
+int tls_set_verify( const char *ca_file, const char *hostname );
 
 /**
  * Wait for a client hello and negotiate a TLS channel as the server

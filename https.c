@@ -270,6 +270,9 @@ int main( int argc, char *argv[ ] )
   int master_secret_length;
   unsigned char *master_secret;
   int session_id_length;
+  // verify the server against the system trust store
+  // unless -k is given
+  char *ca_file = "/etc/ssl/certs/ca-certificates.crt";
   unsigned char *session_id;
 #ifdef WIN32
   WSADATA wsaData;
@@ -304,6 +307,15 @@ int main( int argc, char *argv[ ] )
     else if ( !strcmp( "-s", argv[ ind ] ) )
     {
       session_id_length = hex_decode( argv[ ++ind ], &session_id );
+    }
+    else if ( !strcmp( "-k", argv[ ind ] ) )
+    {
+      // don't verify the server certificate
+      ca_file = NULL;
+    }
+    else if ( !strcmp( "-C", argv[ ind ] ) )
+    {
+      ca_file = argv[ ++ind ];
     }
     else if ( !strcmp( "-V", argv[ ind ] ) )
     {
@@ -359,6 +371,13 @@ int main( int argc, char *argv[ ] )
       *colon = '\0';
       port = atoi( colon + 1 );
     }
+  }
+
+  if ( tls_set_verify( ca_file, host ) < 0 )
+  {
+    fprintf( stderr, "Error - unable to load trusted roots from '%s'.\n",
+      ca_file );
+    return 1;
   }
 
   if ( proxy_host )

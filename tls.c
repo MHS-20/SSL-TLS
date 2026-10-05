@@ -24,6 +24,7 @@
 #include "ecc.h"
 #include "ecdsa.h"
 #include "random.h"
+#include "sha512.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -399,6 +400,8 @@ static unsigned short client_cipher_suite = 0;
 // Offered in preference order: forward-secret ECDHE first, then plain RSA.
 static const unsigned short default_client_suites[] =
 {
+  TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
   TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
   TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
   TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
@@ -410,6 +413,27 @@ static const unsigned short default_client_suites[] =
 };
 #define NUM_DEFAULT_CLIENT_SUITES \
   ( sizeof( default_client_suites ) / sizeof( unsigned short ) )
+
+// Certificate verification trusted roots and the name
+// the server's certificate must carry. No roots = no verification.
+static signed_x509_certificate *trusted_roots = NULL;
+static int trusted_roots_count = 0;
+static char *expected_hostname = NULL;
+
+int tls_set_verify( const char *ca_file, const char *hostname )
+{
+  trusted_roots_count = 0;
+  if ( ca_file &&
+       ( trusted_roots_count =
+           x509_load_pem_bundle( ca_file, &trusted_roots ) ) <= 0 )
+  {
+    trusted_roots_count = 0;
+    return -1;
+  }
+  free( expected_hostname );
+  expected_hostname = hostname ? strdup( hostname ) : NULL;
+  return trusted_roots_count;
+}
 
 static int min_version = TLS_1_0;
 static int max_version = TLS_1_2;
@@ -480,7 +504,8 @@ ExtensionType;
 typedef enum
 {
   secp192r1 = 19,
-  secp256r1 = 23
+  secp256r1 = 23,
+  secp384r1 = 24
 }
 named_curve;
 
@@ -553,6 +578,12 @@ static unsigned char *append_extension( unsigned char *write_ptr,
   return append_buffer( write_ptr, ( void * ) data, data_length );
 }
 
+static int is_ip_address( const char *host )
+{
+  return strspn( host, "0123456789." ) == strlen( host ) ||
+    strchr( host, ':' ) != NULL;
+}
+
 static unsigned short add_client_hello_extensions( unsigned char **extensions,
                                                    TLSParameters *parameters,
                                                    int renegotiating )
@@ -563,12 +594,14 @@ static unsigned short add_client_hello_extensions( unsigned char **extensions,
   // RFC 4492 5.1: the named curves and point formats this client handles.
   // without them a server can't tell which curve to pick.
   static const unsigned char supported_curves[] =
-    { 0x00, 0x04, 0x00, secp256r1, 0x00, secp192r1 };
-  static const unsigned char supported_point_formats[] =
-    { 0x01, uncompressed };
+    { 0x00, 0x06, 0x00, secp256r1, 0x00, secp384r1, 0x00, secp192r1 };
+  // ECPointFormat "uncompressed" is 0 here, unlike the 4 that prefixes an
+  // uncompressed point
+  static const unsigned char supported_point_formats[] = { 0x01, 0x00 };
   // RFC 5246 7.4.1.4.1: without this a TLS 1.2 server assumes SHA-1
   static const unsigned char supported_signature_algorithms[] =
-    { 0x00, 0x08, sha256, sig_rsa, sha256, sig_ecdsa,
+    { 0x00, 0x0C, sha256, sig_rsa, sha256, sig_ecdsa,
+      sha384, sig_rsa, sha384, sig_ecdsa,
       sha1, sig_rsa, sha1, sig_ecdsa };
 
   if ( parameters->support_secure_renegotiation )
@@ -580,7 +613,27 @@ static unsigned short add_client_hello_extensions( unsigned char **extensions,
 
   // 4 bytes of type and length per extension, plus their data
   write_ptr = *extensions = ( unsigned char * ) malloc(
-    renegotiation_extension_length + 64 );
+    renegotiation_extension_length + 64 +
+    ( expected_hostname ? strlen( expected_hostname ) + 9 : 0 ) );
+
+  // (it only parses SNI on the server): name the host, so
+  // a server hosting several sites can pick the right certificate. IP
+  // addresses aren't allowed in SNI (RFC 6066 3).
+  if ( expected_hostname && !is_ip_address( expected_hostname ) )
+  {
+    unsigned short name_length = strlen( expected_hostname );
+    unsigned char *server_name_data = malloc( name_length + 5 );
+    unsigned short list_length = htons( name_length + 3 );
+    unsigned short host_length = htons( name_length );
+
+    memcpy( server_name_data, &list_length, 2 );
+    server_name_data[ 2 ] = 0; // host_name
+    memcpy( server_name_data + 3, &host_length, 2 );
+    memcpy( server_name_data + 5, expected_hostname, name_length );
+    write_ptr = append_extension( write_ptr, server_name, server_name_data,
+      name_length + 5 );
+    free( server_name_data );
+  }
 
   if ( renegotiation_extension )
   {
@@ -1123,6 +1176,8 @@ static int is_ecdhe_suite( int suite )
     case TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:
     case TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:
     case TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
+    case TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
       return 1;
     default:
       return 0;
@@ -1203,6 +1258,8 @@ static int send_client_key_exchange( int connection, TLSParameters *parameters )
     case TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:
     case TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:
     case TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
+    case TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
       premaster_secret_len = parameters->server_ecdh_params.p.size;
       premaster_secret = malloc( premaster_secret_len );
       key_exchange_message_len = ecdh_key_exchange(
@@ -1550,6 +1607,10 @@ void init_tls()
   init_cipher_suite( TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, 16, 16, 16,
     SHA1_BYTE_SIZE, aes_128_encrypt, aes_128_decrypt, new_sha1_digest,
     NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, 0, 4, 16, 16,
+    NULL, NULL, NULL, aes_gcm_encrypt, aes_gcm_decrypt );
+  init_cipher_suite( TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, 0, 4, 16, 16,
+    NULL, NULL, NULL, aes_gcm_encrypt, aes_gcm_decrypt );
   init_cipher_suite( TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, 16, 16, 32,
     SHA1_BYTE_SIZE, aes_256_encrypt, aes_256_decrypt, new_sha1_digest,
     NULL, NULL );
@@ -1950,6 +2011,8 @@ static const unsigned char OID_sha1[] =
   { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
 static const unsigned char OID_sha256[] =
   { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+static const unsigned char OID_sha384[] =
+  { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
 
 /**
  * Hash client random, server random and message with the given algorithm
@@ -1971,6 +2034,9 @@ static int hash_signed_params( HashAlgorithm hash_alg,
       break;
     case sha256:
       new_sha256_digest( digest );
+      break;
+    case sha384:
+      new_sha384_digest( digest );
       break;
     default:
       fprintf( stderr, "Unsupported signature hash algorithm %d\n", hash_alg );
@@ -2031,9 +2097,10 @@ static int verify_signature( unsigned char *message,
       struct asn1struct *hash_oid;
       struct asn1struct *hash_value;
       const unsigned char *expected_oid =
+        ( hash_alg == sha384 ) ? OID_sha384 :
         ( hash_alg == sha256 ) ? OID_sha256 : OID_sha1;
-      int expected_oid_len = ( hash_alg == sha256 ) ?
-        sizeof( OID_sha256 ) : sizeof( OID_sha1 );
+      int expected_oid_len = ( hash_alg == sha384 ) ? sizeof( OID_sha384 ) :
+        ( hash_alg == sha256 ) ? sizeof( OID_sha256 ) : sizeof( OID_sha1 );
 
       if ( !asn1parse( decrypted_signature, decrypted_signature_length,
                        &rsa_signature ) )
@@ -2150,6 +2217,9 @@ static char *parse_server_key_exchange( unsigned char *read_pos,
             break;
           case secp192r1:
             get_named_curve( "prime192v1", &parameters->server_ecdh_params );
+            break;
+          case secp384r1:
+            get_named_curve( "secp384r1", &parameters->server_ecdh_params );
             break;
           default:
             fprintf( stderr, "error, unsupported named curve %d\n", curve );
@@ -2728,6 +2798,34 @@ static int receive_tls_msg( int connection,
           }
           break;
         case certificate:
+          if ( parameters->connection_end == connection_end_client &&
+               trusted_roots_count )
+          {
+            // verify the chain before using its key
+            signed_x509_certificate *chain;
+            int chain_length = parse_x509_chain_all( read_pos,
+              handshake.length, &chain );
+            x509_verify_result result = x509_verify_chain( chain,
+              chain_length, trusted_roots, trusted_roots_count,
+              expected_hostname, time( NULL ) );
+
+            while ( chain_length > 0 )
+            {
+              free_x509_certificate( &chain[ --chain_length ] );
+            }
+            free( chain );
+            if ( result != X509_OK )
+            {
+              fprintf( stderr, "Rejected server certificate: %s\n",
+                x509_verify_result_string( result ) );
+              send_alert_message( connection,
+                result == X509_UNTRUSTED ? unknown_ca :
+                ( result == X509_EXPIRED ? certificate_expired :
+                  bad_certificate ),
+                &parameters->active_send_parameters );
+              return -1;
+            }
+          }
           read_pos = parse_x509_chain( read_pos, handshake.length,
             &parameters->server_public_key );
           if ( read_pos == NULL )

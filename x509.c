@@ -10,6 +10,7 @@
 #include "asn1.h"
 #include "md5.h"
 #include "sha.h"
+#include "sha512.h"
 #include "hex.h"
 
 void init_x509_certificate( signed_x509_certificate *certificate )
@@ -32,6 +33,12 @@ void init_x509_certificate( signed_x509_certificate *certificate )
   set_huge( &certificate->dsa_signature_value.s, 0 );
   certificate->hash = NULL;
   certificate->tbsCertificate.certificate_authority = 0;
+  certificate->tbsCertificate.issuer_der = NULL;
+  certificate->tbsCertificate.issuer_der_len = 0;
+  certificate->tbsCertificate.subject_der = NULL;
+  certificate->tbsCertificate.subject_der_len = 0;
+  certificate->tbsCertificate.basic_constraints_ca = 0;
+  certificate->tbsCertificate.dns_names_count = 0;
 }
 
 static void free_x500_name( name *x500_name )
@@ -62,6 +69,13 @@ void free_x509_certificate( signed_x509_certificate *certificate )
   {
     free( certificate->hash );
   }
+  free( certificate->tbsCertificate.issuer_der );
+  free( certificate->tbsCertificate.subject_der );
+  while ( certificate->tbsCertificate.dns_names_count )
+  {
+    free( certificate->tbsCertificate.dns_names[
+      --certificate->tbsCertificate.dns_names_count ] );
+  }
 }
 
 static int parse_huge( huge *target, struct asn1struct *source )
@@ -82,38 +96,59 @@ static const unsigned char OID_sha1WithDSA[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03 };
 static const unsigned char OID_sha256WithECDSA[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+static const unsigned char OID_sha256WithRSA[] =
+  { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
+static const unsigned char OID_sha384WithRSA[] =
+  { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C };
+static const unsigned char OID_sha512WithRSA[] =
+  { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
+static const unsigned char OID_sha384WithECDSA[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
+
+#define OID_IS( node, oid ) \
+  ( ( node )->length == sizeof( oid ) && \
+    !memcmp( ( node )->data, oid, sizeof( oid ) ) )
 
 static int parse_algorithm_identifier( signatureAlgorithmIdentifier *target,
                                        struct asn1struct *source )
 {
   struct asn1struct *oid = ( struct asn1struct * ) source->children;
 
-  if ( !memcmp( oid->data, OID_md5WithRSA, oid->length ) )
+  if ( OID_IS( oid, OID_md5WithRSA ) )
   {
     *target = md5WithRSAEncryption;
   }
-  else if ( !memcmp( oid->data, OID_sha1WithRSA, oid->length ) )
+  else if ( OID_IS( oid, OID_sha1WithRSA ) )
   {
     *target = shaWithRSAEncryption;
   }
-  else if ( !memcmp( oid->data, OID_sha1WithDSA, oid->length ) )
+  else if ( OID_IS( oid, OID_sha1WithDSA ) )
   {
     *target = shaWithDSA;
   }
-  else if ( !memcmp( oid->data, OID_sha256WithECDSA, oid->length ) )
+  else if ( OID_IS( oid, OID_sha256WithECDSA ) )
   {
     *target = sha256WithECDSA;
   }
+  else if ( OID_IS( oid, OID_sha256WithRSA ) )
+  {
+    *target = sha256WithRSAEncryption;
+  }
+  else if ( OID_IS( oid, OID_sha384WithRSA ) )
+  {
+    *target = sha384WithRSAEncryption;
+  }
+  else if ( OID_IS( oid, OID_sha512WithRSA ) )
+  {
+    *target = sha512WithRSAEncryption;
+  }
+  else if ( OID_IS( oid, OID_sha384WithECDSA ) )
+  {
+    *target = sha384WithECDSA;
+  }
   else
   {
-    int i;
-    fprintf( stderr, "Unsupported or unrecognized algorithm identifier OID " );
-    for ( i = 0; i < oid->length; i++ )
-    {
-      fprintf( stderr, "%.02x ", oid->data[ i ] );
-    }
-    fprintf( stderr, "\n" );
-    return 2;
+    *target = unsupportedSignatureAlgorithm;
   }
 
   return 0;
@@ -192,16 +227,44 @@ int parse_name( name *target, struct asn1struct *source )
       int i;
 
       // This is just advisory - NOT a problem
-      printf( "Skipping unrecognized or unsupported name token OID of " );
-      for ( i = 0; i < type->length; i++ )
-      {
-        printf( "%.02x ", type->data[ i ] );
-      }
-      printf( "\n" );
     }
 
     typeValuePair = typeValuePair->next;
   }
+
+  return 0;
+}
+
+/**
+ * UTCTime is YYMMDDHHMMSSZ (YY < 50 means 20YY, RFC 5280 4.1.2.5.1);
+ * GeneralizedTime is YYYYMMDDHHMMSSZ. Both are UTC.
+ */
+static int parse_time( struct asn1struct *time, struct tm *target )
+{
+  char text[ 16 ];
+  int year_digits = ( time->tag == ASN1_GENERALIZED_TIME ) ? 4 : 2;
+
+  if ( time->length < year_digits + 10 || time->length >= sizeof( text ) )
+  {
+    return 1;
+  }
+  memcpy( text, time->data, time->length );
+  text[ time->length ] = '\0';
+
+  if ( sscanf( text, year_digits == 4 ? "%4d%2d%2d%2d%2d%2d" :
+                                        "%2d%2d%2d%2d%2d%2d",
+       &target->tm_year, &target->tm_mon, &target->tm_mday,
+       &target->tm_hour, &target->tm_min, &target->tm_sec ) < 6 )
+  {
+    return 1;
+  }
+
+  if ( year_digits == 2 )
+  {
+    target->tm_year += ( target->tm_year < 50 ) ? 2000 : 1900;
+  }
+  target->tm_year -= 1900;
+  target->tm_mon -= 1;
 
   return 0;
 }
@@ -220,29 +283,19 @@ static int parse_validity( validity_period *target, struct asn1struct *source )
   memset( &not_after_tm, 0, sizeof( struct tm ) );
 
   // Convert time instances into time_t
-  if ( sscanf( ( char * ) not_before->data, "%2d%2d%2d%2d%2d%2d",
-       &not_before_tm.tm_year, &not_before_tm.tm_mon, &not_before_tm.tm_mday,
-       &not_before_tm.tm_hour, &not_before_tm.tm_min, &not_before_tm.tm_sec ) < 6 )
+  if ( parse_time( not_before, &not_before_tm ) )
   {
     fprintf( stderr, "Error parsing not before; malformed date." );
     return 6;
   }
-  if ( sscanf( ( char * ) not_after->data, "%2d%2d%2d%2d%2d%2d",
-       &not_after_tm.tm_year, &not_after_tm.tm_mon, &not_after_tm.tm_mday,
-       &not_after_tm.tm_hour, &not_after_tm.tm_min, &not_after_tm.tm_sec ) < 6 )
+  if ( parse_time( not_after, &not_after_tm ) )
   {
     fprintf( stderr, "Error parsing not after; malformed date." );
     return 7;
   }
 
-  not_before_tm.tm_year += 100;
-  not_after_tm.tm_year += 100;
-  not_before_tm.tm_mon -= 1;
-  not_after_tm.tm_mon -= 1;
-
-  // TODO account for TZ information on end
-  target->notBefore = mktime( &not_before_tm );
-  target->notAfter = mktime( &not_after_tm );
+  target->notBefore = timegm( &not_before_tm );
+  target->notAfter = timegm( &not_after_tm );
 
   return 0;
 }
@@ -278,6 +331,8 @@ static const unsigned char OID_PRIME192V1[] =
 // A.K.A. secp256R1, AKA NIST P-256 
 static const unsigned char OID_PRIME256V1[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+static const unsigned char OID_SECP384R1[] =
+  { 0x2B, 0x81, 0x04, 0x00, 0x22 };
 
 static int parse_public_key_info( public_key_info *target,
                                   struct asn1struct *source )
@@ -311,11 +366,14 @@ static int parse_public_key_info( public_key_info *target,
         return 1;
       }
     }
+    else if ( OID_IS( curve, OID_SECP384R1 ) )
+    {
+      get_named_curve( "secp384r1", &target->ecdsa_curve );
+    }
     else
     {
-      fprintf( stderr,
-        "Error, unsupported named curve in ECDSA certificate\n" );
-      return 1;
+      target->algorithm = unsupported_key;
+      return 0;
     }
 
     // Skip the bit string's leading 0 byte and the X9.62
@@ -326,6 +384,12 @@ static int parse_public_key_info( public_key_info *target,
       ( public_key->data + 2 ) + ( ( public_key->length - 2 ) / 2 ),
       ( public_key->length - 2 ) / 2 );
 
+    return 0;
+  }
+
+  if ( !OID_IS( oid, OID_RSA ) && !OID_IS( oid, OID_DSA ) )
+  {
+    target->algorithm = unsupported_key;
     return 0;
   }
 
@@ -364,8 +428,7 @@ static int parse_public_key_info( public_key_info *target,
   }
   else
   {
-    fprintf( stderr, "Error; unsupported OID in public key info.\n" );
-    return 7;
+    target->algorithm = unsupported_key;
   }
 
   asn1free( &public_key_value );
@@ -374,6 +437,9 @@ static int parse_public_key_info( public_key_info *target,
 }
 
 static const unsigned char OID_keyUsage[] = { 0x55, 0x1D, 0x0F };
+static const unsigned char OID_basicConstraints[] = { 0x55, 0x1D, 0x13 };
+static const unsigned char OID_subjectAltName[] = { 0x55, 0x1D, 0x11 };
+#define GENERAL_NAME_DNS 2
 #define BIT_CERT_SIGNER 5
 
 static int parse_extension( x509_certificate *certificate,
@@ -396,7 +462,7 @@ static int parse_extension( x509_certificate *certificate,
     critical = NULL;
   }
 
-  if ( !memcmp( oid->data, OID_keyUsage, oid->length ) )
+  if ( OID_IS( oid, OID_keyUsage ) )
   {
     struct asn1struct key_usage_bit_string;
     asn1parse( data->data, data->length, &key_usage_bit_string );
@@ -409,7 +475,45 @@ static int parse_extension( x509_certificate *certificate,
     asn1free( &key_usage_bit_string );
   }
 
-  // TODO recognize and parse other extensions - there are several
+  else if ( OID_IS( oid, OID_basicConstraints ) )
+  {
+    // SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPT }
+    struct asn1struct constraints;
+    if ( !asn1parse( data->data, data->length, &constraints ) )
+    {
+      if ( constraints.children &&
+           constraints.children->tag == ASN1_BOOLEAN &&
+           constraints.children->length == 1 &&
+           constraints.children->data[ 0 ] )
+      {
+        certificate->basic_constraints_ca = 1;
+      }
+      asn1free( &constraints );
+    }
+  }
+  else if ( OID_IS( oid, OID_subjectAltName ) )
+  {
+    // SEQUENCE OF GeneralName; dNSName is [2] IA5String
+    struct asn1struct names;
+    struct asn1struct *general_name;
+    if ( !asn1parse( data->data, data->length, &names ) )
+    {
+      for ( general_name = names.children; general_name;
+            general_name = general_name->next )
+      {
+        if ( general_name->tag_class == ASN1_CONTEXT_SPECIFIC &&
+             general_name->tag == GENERAL_NAME_DNS &&
+             certificate->dns_names_count < MAX_DNS_NAMES )
+        {
+          char *dns_name = malloc( general_name->length + 1 );
+          memcpy( dns_name, general_name->data, general_name->length );
+          dns_name[ general_name->length ] = '\0';
+          certificate->dns_names[ certificate->dns_names_count++ ] = dns_name;
+        }
+      }
+      asn1free( &names );
+    }
+  }
 
   return 0;
 }
@@ -475,6 +579,12 @@ static int parse_tbs_certificate( x509_certificate *target,
                                    signatureAlgorithmIdentifier ) )
     { return 3; }
   if ( parse_name( &target->issuer, issuer ) ) { return 4; }
+  target->issuer_der = malloc( issuer->length );
+  memcpy( target->issuer_der, issuer->data, issuer->length );
+  target->issuer_der_len = issuer->length;
+  target->subject_der = malloc( subject->length );
+  memcpy( target->subject_der, subject->data, subject->length );
+  target->subject_der_len = subject->length;
   if ( parse_validity( &target->validity, validity ) ) { return 5; }
   if ( parse_name( &target->subject, subject ) ) { return 6; }
   if ( parse_public_key_info( &target->subjectPublicKeyInfo, publicKeyInfo ) )
@@ -550,6 +660,9 @@ int parse_x509_certificate( const unsigned char *buffer,
   {
     case md5WithRSAEncryption:
     case shaWithRSAEncryption:
+    case sha256WithRSAEncryption:
+    case sha384WithRSAEncryption:
+    case sha512WithRSAEncryption:
       if ( parse_rsa_signature_value( parsed_certificate, signatureValue ) )
       {
         return 42;
@@ -557,6 +670,7 @@ int parse_x509_certificate( const unsigned char *buffer,
       break;
     case shaWithDSA:
     case sha256WithECDSA:
+    case sha384WithECDSA:
       if ( parse_dsa_signature_value( parsed_certificate, signatureValue ) )
       {
         return 42;
@@ -574,10 +688,21 @@ int parse_x509_certificate( const unsigned char *buffer,
       new_sha1_digest( &digest );
       break;
     case sha256WithECDSA:
+    case sha256WithRSAEncryption:
       new_sha256_digest( &digest );
       break;
-    default:
+    case sha384WithECDSA:
+    case sha384WithRSAEncryption:
+      new_sha384_digest( &digest );
       break;
+    case sha512WithRSAEncryption:
+      new_sha512_digest( &digest );
+      break;
+    default:
+      parsed_certificate->hash = NULL;
+      parsed_certificate->hash_len = 0;
+      asn1free( &certificate );
+      return 0;
   }
 
   update_digest( &digest, tbsCertificate->data, tbsCertificate->length );
@@ -713,7 +838,6 @@ char *parse_x509_chain( unsigned char *buffer,
   return ptr;
 }
 
-#ifdef TEST_X509
 /**
  * An RSA signature is an ASN.1 DER-encoded PKCS-7 structure including
  * the OID of the signature algorithm (again), and the signature value.
@@ -733,52 +857,290 @@ static int validate_certificate_rsa( signed_x509_certificate *certificate,
 
   if ( pkcs7_signature_len == -1 )
   {
-    fprintf( stderr, "Unable to decode signature value.\n" );
     return valid;
   }
   if ( asn1parse( pkcs7_signature_decrypted, pkcs7_signature_len,
                   &pkcs7_signature ) )
   {
-    fprintf( stderr, "Unable to parse signature\n" );
+    free( pkcs7_signature_decrypted );
     return valid;
   }
 
-  hash_value = pkcs7_signature.children->next;
+  hash_value = pkcs7_signature.children ? pkcs7_signature.children->next :
+    NULL;
 
-  if ( memcmp( hash_value->data, certificate->hash, certificate->hash_len * 4 ) )
-  {
-    valid = 0;
-  }
-  else
-  {
-    valid = 1;
-  }
+  valid = hash_value &&
+    hash_value->length == certificate->hash_len * 4 &&
+    !memcmp( hash_value->data, certificate->hash, certificate->hash_len * 4 );
 
   asn1free( &pkcs7_signature );
+  free( pkcs7_signature_decrypted );
 
   return valid;
 }
 
-static int validate_certificate_dsa( signed_x509_certificate *certificate )
+int x509_verify_signature( signed_x509_certificate *certificate,
+                           public_key_info *issuer_key )
 {
-  return dsa_verify(
-    &certificate->tbsCertificate.subjectPublicKeyInfo.dsa_parameters,
-    &certificate->tbsCertificate.subjectPublicKeyInfo.dsa_public_key,
-    certificate->hash,
-    certificate->hash_len * 4,
-    &certificate->dsa_signature_value );
+  if ( !certificate->hash )
+  {
+    return 0; // unsupported signature algorithm
+  }
+
+  switch ( certificate->algorithm )
+  {
+    case md5WithRSAEncryption:
+    case shaWithRSAEncryption:
+    case sha256WithRSAEncryption:
+    case sha384WithRSAEncryption:
+    case sha512WithRSAEncryption:
+      return issuer_key->algorithm == rsa &&
+        validate_certificate_rsa( certificate, &issuer_key->rsa_public_key );
+    case shaWithDSA:
+      return issuer_key->algorithm == dsa &&
+        dsa_verify( &issuer_key->dsa_parameters,
+                    &issuer_key->dsa_public_key,
+                    certificate->hash,
+                    certificate->hash_len * 4,
+                    &certificate->dsa_signature_value );
+    case sha256WithECDSA:
+    case sha384WithECDSA:
+      return issuer_key->algorithm == ecdsa &&
+        ecdsa_verify( &issuer_key->ecdsa_curve,
+                      &issuer_key->ecdsa_public_key,
+                      certificate->hash,
+                      certificate->hash_len,
+                      &certificate->dsa_signature_value );
+    default:
+      return 0;
+  }
 }
 
-static int validate_certificate_ecdsa( signed_x509_certificate *certificate )
+static int same_name( unsigned char *a, int a_len,
+                      unsigned char *b, int b_len )
 {
-  return ecdsa_verify(
-    &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_curve,
-    &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key,
-    certificate->hash,
-    certificate->hash_len * 4,
-    &certificate->dsa_signature_value );
+  return a_len == b_len && !memcmp( a, b, a_len );
 }
 
+static int is_issuer_of( x509_certificate *issuer, x509_certificate *subject )
+{
+  return same_name( issuer->subject_der, issuer->subject_der_len,
+                    subject->issuer_der, subject->issuer_der_len );
+}
+
+/**
+ * Case-insensitive match of a certificate name against a host name; a
+ * leading "*." matches exactly one label (RFC 6125 6.4.3).
+ */
+static int hostname_matches( const char *pattern, const char *hostname )
+{
+  if ( !strncmp( pattern, "*.", 2 ) )
+  {
+    const char *dot = strchr( hostname, '.' );
+    return dot && dot != hostname && !strcasecmp( pattern + 1, dot );
+  }
+  return !strcasecmp( pattern, hostname );
+}
+
+const char *x509_verify_result_string( x509_verify_result result )
+{
+  switch ( result )
+  {
+    case X509_OK: return "ok";
+    case X509_BAD_SIGNATURE: return "bad certificate signature";
+    case X509_UNTRUSTED: return "certificate not signed by a trusted root";
+    case X509_EXPIRED: return "certificate expired";
+    case X509_NOT_YET_VALID: return "certificate not yet valid";
+    case X509_NOT_A_CA: return "issuer is not a CA";
+    case X509_HOSTNAME_MISMATCH: return "certificate doesn't match host name";
+    case X509_EMPTY_CHAIN: return "no certificate";
+  }
+  return "unknown error";
+}
+
+x509_verify_result x509_verify_chain( signed_x509_certificate *chain,
+                                      int chain_length,
+                                      signed_x509_certificate *roots,
+                                      int roots_count,
+                                      const char *hostname,
+                                      time_t now )
+{
+  int i, j;
+  x509_certificate *leaf;
+
+  if ( chain_length < 1 )
+  {
+    return X509_EMPTY_CHAIN;
+  }
+
+  leaf = &chain[ 0 ].tbsCertificate;
+  if ( hostname )
+  {
+    int matched = 0;
+
+    if ( leaf->dns_names_count )
+    {
+      for ( i = 0; i < leaf->dns_names_count && !matched; i++ )
+      {
+        matched = hostname_matches( leaf->dns_names[ i ], hostname );
+      }
+    }
+    else if ( leaf->subject.idAtCommonName )
+    {
+      matched = hostname_matches( leaf->subject.idAtCommonName, hostname );
+    }
+    if ( !matched )
+    {
+      return X509_HOSTNAME_MISMATCH;
+    }
+  }
+
+  for ( i = 0; i < chain_length; i++ )
+  {
+    x509_certificate *certificate = &chain[ i ].tbsCertificate;
+
+    if ( now < certificate->validity.notBefore )
+    {
+      return X509_NOT_YET_VALID;
+    }
+    if ( now > certificate->validity.notAfter )
+    {
+      return X509_EXPIRED;
+    }
+
+    // A certificate that is itself a trusted root ends the chain
+    for ( j = 0; j < roots_count; j++ )
+    {
+      x509_certificate *root = &roots[ j ].tbsCertificate;
+      if ( same_name( root->subject_der, root->subject_der_len,
+                      certificate->subject_der,
+                      certificate->subject_der_len ) &&
+           chain[ i ].hash_len == roots[ j ].hash_len && chain[ i ].hash &&
+           !memcmp( chain[ i ].hash, roots[ j ].hash,
+                    chain[ i ].hash_len * 4 ) )
+      {
+        return X509_OK;
+      }
+    }
+
+    // Otherwise it must be signed by a trusted root...
+    for ( j = 0; j < roots_count; j++ )
+    {
+      if ( is_issuer_of( &roots[ j ].tbsCertificate, certificate ) &&
+           x509_verify_signature( &chain[ i ],
+             &roots[ j ].tbsCertificate.subjectPublicKeyInfo ) )
+      {
+        return X509_OK;
+      }
+    }
+
+    // ...or by the next certificate in the chain, which must be a CA
+    if ( i + 1 >= chain_length ||
+         !is_issuer_of( &chain[ i + 1 ].tbsCertificate, certificate ) )
+    {
+      return X509_UNTRUSTED;
+    }
+    if ( !chain[ i + 1 ].tbsCertificate.basic_constraints_ca )
+    {
+      return X509_NOT_A_CA;
+    }
+    if ( !x509_verify_signature( &chain[ i ],
+           &chain[ i + 1 ].tbsCertificate.subjectPublicKeyInfo ) )
+    {
+      return X509_BAD_SIGNATURE;
+    }
+  }
+
+  return X509_UNTRUSTED;
+}
+
+int x509_load_pem_bundle( const char *path,
+                          signed_x509_certificate **certificates )
+{
+  int file;
+  struct stat file_stat;
+  unsigned char *pem, *pos, *der;
+  int count = 0, der_len;
+
+  *certificates = NULL;
+  if ( ( file = open( path, O_RDONLY ) ) == -1 ||
+       fstat( file, &file_stat ) )
+  {
+    return -1;
+  }
+  pem = malloc( file_stat.st_size + 1 );
+  if ( read( file, pem, file_stat.st_size ) != file_stat.st_size )
+  {
+    close( file );
+    free( pem );
+    return -1;
+  }
+  close( file );
+  pem[ file_stat.st_size ] = '\0';
+  der = malloc( file_stat.st_size );
+
+  for ( pos = strstr( pem, "-----BEGIN CERTIFICATE-----" ); pos;
+        pos = strstr( pos + 1, "-----BEGIN CERTIFICATE-----" ) )
+  {
+    der_len = pem_decode( pos, der );
+    *certificates = realloc( *certificates,
+      ( count + 1 ) * sizeof( signed_x509_certificate ) );
+    init_x509_certificate( &( *certificates )[ count ] );
+    if ( !parse_x509_certificate( der, der_len, &( *certificates )[ count ] ) )
+    {
+      count++;
+    }
+    else
+    {
+      free_x509_certificate( &( *certificates )[ count ] );
+    }
+  }
+
+  free( der );
+  free( pem );
+
+  return count;
+}
+
+int parse_x509_chain_all( unsigned char *buffer,
+                          int pdu_length,
+                          signed_x509_certificate **chain )
+{
+  unsigned char *ptr = buffer + 3;
+  unsigned int certificate_length;
+  int count = 0;
+
+  *chain = NULL;
+  if ( pdu_length < 3 )
+  {
+    return -1;
+  }
+
+  while ( ( ptr - buffer ) + 3 <= pdu_length )
+  {
+    certificate_length = ( *ptr << 16 ) | ( *( ptr + 1 ) << 8 ) |
+      ( *( ptr + 2 ) );
+    ptr += 3;
+    if ( ( ptr - buffer ) + certificate_length > pdu_length )
+    {
+      break;
+    }
+    *chain = realloc( *chain, ( count + 1 ) * sizeof( signed_x509_certificate ) );
+    init_x509_certificate( &( *chain )[ count ] );
+    if ( parse_x509_certificate( ptr, certificate_length,
+                                 &( *chain )[ count ] ) )
+    {
+      free_x509_certificate( &( *chain )[ count ] );
+      return count ? count : -1;
+    }
+    count++;
+    ptr += certificate_length;
+  }
+
+  return count;
+}
+
+#ifdef TEST_X509
 static void output_x500_name( name *x500_name )
 {
   printf( "C=%s/ST=%s/L=%s/O=%s/OU=%s/CN=%s\n",
@@ -868,6 +1230,12 @@ static void display_x509_certificate( signed_x509_certificate *certificate )
     case sha256WithECDSA:
       printf( "SHA-256 with ECDSA\n" );
       break;
+    case sha256WithRSAEncryption:
+      printf( "SHA-256 with RSA Encryption\n" );
+      break;
+    default:
+      printf( "unsupported\n" );
+      break;
   }
 
   printf( "Signature value: " );
@@ -907,6 +1275,22 @@ int main( int argc, char *argv[ ] )
   int error_code;
 
   signed_x509_certificate certificate;
+
+  if ( argc == 5 && !strcmp( argv[ 1 ], "-verify" ) )
+  {
+    // x509_test -verify <trusted roots.pem> <hostname> <chain.pem>
+    signed_x509_certificate *roots, *chain;
+    int roots_count = x509_load_pem_bundle( argv[ 2 ], &roots );
+    int chain_length = x509_load_pem_bundle( argv[ 4 ], &chain );
+    x509_verify_result result;
+
+    printf( "%d trusted roots, %d certificates in chain\n", roots_count,
+      chain_length );
+    result = x509_verify_chain( chain, chain_length, roots, roots_count,
+      argv[ 3 ], time( NULL ) );
+    printf( "%s\n", x509_verify_result_string( result ) );
+    return result;
+  }
 
   if ( argc < 3 )
   {
@@ -966,8 +1350,9 @@ int main( int argc, char *argv[ ] )
     {
       case md5WithRSAEncryption:
       case shaWithRSAEncryption:
-        if ( validate_certificate_rsa( &certificate,
-          &certificate.tbsCertificate.subjectPublicKeyInfo.rsa_public_key ) )
+      case sha256WithRSAEncryption:
+        if ( x509_verify_signature( &certificate,
+          &certificate.tbsCertificate.subjectPublicKeyInfo ) )
         {
           printf( "Certificate is a valid self-signed certificate.\n" );
         }
@@ -977,7 +1362,8 @@ int main( int argc, char *argv[ ] )
         }
         break;
       case sha256WithECDSA:
-        if ( validate_certificate_ecdsa( &certificate ) )
+        if ( x509_verify_signature( &certificate,
+          &certificate.tbsCertificate.subjectPublicKeyInfo ) )
         {
           printf( "Certificate is a valid self-signed certificate.\n" );
         }
@@ -987,7 +1373,8 @@ int main( int argc, char *argv[ ] )
         }
         break;
       case shaWithDSA:
-        if ( validate_certificate_dsa( &certificate ) )
+        if ( x509_verify_signature( &certificate,
+          &certificate.tbsCertificate.subjectPublicKeyInfo ) )
         {
           printf( "Certificate is a valid self-signed certificate.\n" );
         }

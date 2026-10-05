@@ -24,16 +24,16 @@ rc4_test: rc4.c hex.c
 rsa_test: rsa.c random.c huge.c hex.c
 	$(CC) $(CFLAGS) -DTEST_RSA -o $@ $^
 
-digest_test: digest.c md5.c sha.c hex.c
+digest_test: digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_DIGEST -o $@ $^ $(LDLIBS)
 
-hmac_test: hmac.c digest.c md5.c sha.c hex.c
+hmac_test: hmac.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_HMAC -o $@ $^ $(LDLIBS)
 
-dsa_test: dsa.c huge.c digest.c md5.c sha.c hex.c
+dsa_test: dsa.c huge.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_DSA -o $@ $^ $(LDLIBS)
 
-ecdsa_test: ecdsa.c ecc.c dsa.c huge.c digest.c md5.c sha.c hex.c
+ecdsa_test: ecdsa.c ecc.c dsa.c huge.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -O2 -DTEST_ECDSA -o $@ $^ $(LDLIBS)
 
 ecc_int_test: ecc_int.c
@@ -47,21 +47,21 @@ clean:
 asn1_test: asn1.c base64.c
 	$(CC) $(CFLAGS) -DTEST_ASN1 -o $@ $^
 
-x509_test: x509.c asn1.c base64.c random.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c hex.c
+x509_test: x509.c asn1.c base64.c random.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_X509 -o $@ $^ $(LDLIBS)
 
-TLS_OBJS = random.c tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c des.c aes.c rc4.c hex.c
+TLS_OBJS = random.c tls.c privkey.c file.c prf.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c dh.c huge.c hmac.c digest.c md5.c sha.c sha512.c des.c aes.c rc4.c hex.c
 
 https: https.c $(TLS_OBJS)
 	$(CC) $(CFLAGS) -O2 -o $@ $^ $(LDLIBS)
 
-prf_test: prf.c hmac.c digest.c md5.c sha.c hex.c
+prf_test: prf.c hmac.c digest.c md5.c sha.c sha512.c hex.c
 	$(CC) $(CFLAGS) -DTEST_PRF -o $@ $^ $(LDLIBS)
 
 ssl_webserver: ssl_webserver.c $(TLS_OBJS)
 	$(CC) $(CFLAGS) -O2 -o $@ $^ $(LDLIBS)
 
-privkey_test: privkey.c file.c asn1.c base64.c huge.c digest.c md5.c sha.c des.c hex.c
+privkey_test: privkey.c file.c asn1.c base64.c huge.c digest.c md5.c sha.c sha512.c des.c hex.c
 	$(CC) $(CFLAGS) -DTEST_PRIVKEY -o $@ $^ $(LDLIBS)
 
 
@@ -70,7 +70,7 @@ openssl_https: openssl_https.c
 	$(CC) $(CFLAGS) -o $@ $^ -lssl -lcrypto
 
 # Appendix C: SSLv2 client, and a replay of the original SSLv2 capture
-SSL2_OBJS = ssl.c random.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c des.c rc4.c hex.c
+SSL2_OBJS = ssl.c random.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c sha512.c des.c rc4.c hex.c
 
 ssl2_https: ssl2_https.c $(SSL2_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

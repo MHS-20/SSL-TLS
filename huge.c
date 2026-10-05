@@ -318,36 +318,80 @@ static void right_shift( huge *h1 )
 /**
  * Multiply h1 by h2, overwriting the value of h1.
  */
+/*
+ * multiply and divide below work on 32-bit limbs instead
+ * of one bit at a time (shift-and-add / shift-and-subtract, reallocating
+ * on every shift). Same interface and results; ECDSA over P-384 went from
+ * seconds to milliseconds.
+ */
+#include <stdint.h>
+
+// Little-endian 32-bit limbs from the big-endian byte representation
+static uint32_t *to_limbs( const huge *h, int *count )
+{
+  int i, n = ( h->size + 3 ) / 4;
+  uint32_t *limbs = calloc( n + 1, sizeof( uint32_t ) );
+
+  for ( i = 0; i < h->size; i++ )
+  {
+    int byte = h->size - 1 - i; // i-th least significant byte
+    limbs[ i / 4 ] |= ( uint32_t ) h->rep[ byte ] << ( 8 * ( i % 4 ) );
+  }
+  while ( n > 1 && !limbs[ n - 1 ] )
+  {
+    n--;
+  }
+  *count = n;
+
+  return limbs;
+}
+
+// Replace h's magnitude with the limbs, dropping leading zero bytes
+static void from_limbs( huge *h, const uint32_t *limbs, int count )
+{
+  int i, size = count * 4;
+
+  while ( size > 1 &&
+          !( ( limbs[ ( size - 1 ) / 4 ] >> ( 8 * ( ( size - 1 ) % 4 ) ) ) &
+             0xFF ) )
+  {
+    size--;
+  }
+  free( h->rep );
+  h->size = size;
+  h->rep = malloc( size );
+  for ( i = 0; i < size; i++ )
+  {
+    h->rep[ size - 1 - i ] = ( limbs[ i / 4 ] >> ( 8 * ( i % 4 ) ) ) & 0xFF;
+  }
+}
+
 void multiply( huge *h1, huge *h2 )
 {
-  unsigned char mask;
-  unsigned int i;
-  int result_sign;
-  huge temp;
+  int n1, n2, i, j;
+  uint32_t *a = to_limbs( h1, &n1 );
+  uint32_t *b = to_limbs( h2, &n2 );
+  uint32_t *r = calloc( n1 + n2, sizeof( uint32_t ) );
+  int result_sign = !( h1->sign == h2->sign );
 
-  set_huge( &temp, 0 );
-  copy_huge( &temp, h1 );
-
-  result_sign = !( h1->sign == h2->sign );
-
-  set_huge( h1, 0 );
-
-  i = h2->size;
-  do
+  for ( i = 0; i < n1; i++ )
   {
-    i--;
-    for ( mask = 0x01; mask; mask <<= 1 )
+    uint64_t carry = 0;
+    for ( j = 0; j < n2; j++ )
     {
-      if ( mask & h2->rep[ i ] )
-      {
-        add( h1, &temp );
-      }
-      left_shift( &temp );
+      uint64_t t = ( uint64_t ) a[ i ] * b[ j ] + r[ i + j ] + carry;
+      r[ i + j ] = ( uint32_t ) t;
+      carry = t >> 32;
     }
+    r[ i + n2 ] = ( uint32_t ) carry;
   }
-  while ( i );
 
+  from_limbs( h1, r, n1 + n2 );
   h1->sign = result_sign;
+
+  free( a );
+  free( b );
+  free( r );
 }
 
 /**
@@ -358,43 +402,26 @@ void multiply( huge *h1, huge *h2 )
  */
 int compare( huge *h1, huge *h2 )
 {
-  int i, j;
+  const unsigned char *p1 = h1->rep, *p2 = h2->rep;
+  int s1 = h1->size, s2 = h2->size;
 
-  if ( h1->size > h2->size )
+  while ( s1 > 0 && !*p1 ) { p1++; s1--; }
+  while ( s2 > 0 && !*p2 ) { p2++; s2--; }
+
+  if ( s1 != s2 )
   {
-    return 1;
+    return s1 > s2 ? 1 : -1;
   }
-
-  if ( h1->size < h2->size )
+  while ( s1-- )
   {
-    return -1;
-  }
-
-  // Otherwise, sizes are equal, have to actually compare.
-  // only have to compare "hi-int", since the lower ints
-  // can't change the comparison.
-  i = j = 0;
-
-  // Otherwise, keep searching through the representational integers
-  // until one is bigger than another - once we've found one, it's
-  // safe to stop, since the "lower order bytes" can't affect the
-  // comparison
-  while ( i < h1->size && j < h2->size )
-  {
-    if ( h1->rep[ i ] < h2->rep[ j ] )
+    if ( *p1 != *p2 )
     {
-      return -1;
+      return *p1 > *p2 ? 1 : -1;
     }
-    else if ( h1->rep[ i ] > h2->rep[ j ] )
-    {
-      return 1;
-    }
-    i++;
-    j++;
+    p1++;
+    p2++;
   }
 
-  // If we got all the way to the end without a comparison, the
-  // two are equal
   return 0;
 }
 
@@ -407,51 +434,140 @@ int compare( huge *h1, huge *h2 )
  * be modified by this routine, but it will end up back where it
  * "started".
  */
+/**
+ * dividend = dividend mod divisor (keeping dividend's sign, as the reference
+ * does); quotient (if not NULL) = |dividend| / |divisor| with the sign of
+ * the true quotient. Knuth's Algorithm D (TAOCP 4.3.1).
+ */
 void divide( huge *dividend, huge *divisor, huge *quotient )
 {
-  int bit_size, bit_position;
+  int m, n, i, j, shift;
+  uint32_t *u0 = to_limbs( dividend, &m );
+  uint32_t *v0 = to_limbs( divisor, &n );
+  uint32_t *u, *v, *q;
+  int quotient_sign = !( dividend->sign == divisor->sign );
 
-  // "bit_position" keeps track of which bit, of the quotient,
-  // is being set or cleared on the current operation.
-  bit_size = bit_position = 0;
-
-  // First, left-shift divisor until it's >= than the dividend
-  while ( compare( divisor, dividend ) < 0 )
+  if ( n == 1 && !v0[ 0 ] )
   {
-    left_shift( divisor );
-    bit_size++;
+    fprintf( stderr, "divide by zero\n" );
+    abort();
   }
 
-  if ( quotient )
+  if ( m < n )
   {
-    quotient->sign = !( dividend->sign == divisor->sign );
-    quotient->size = ( bit_size / 8 ) + 1;
-    quotient->rep = ( unsigned char * )
-      calloc( quotient->size, sizeof( unsigned char ) );
-    memset( quotient->rep, 0, quotient->size );
-  }
-
-  bit_position = 8 - ( bit_size % 8 ) - 1;
-
-  do
-  {
-    if ( compare( divisor, dividend ) <= 0 )
+    // |dividend| < |divisor|: remainder is the dividend, quotient 0
+    if ( quotient )
     {
-      subtract_magnitude( dividend, divisor ); // dividend -= divisor
-      if ( quotient )
+      uint32_t zero = 0;
+      quotient->rep = NULL;
+      from_limbs( quotient, &zero, 1 );
+      quotient->sign = 0;
+    }
+    from_limbs( dividend, u0, m );
+    free( u0 );
+    free( v0 );
+    return;
+  }
+
+  q = calloc( m - n + 1, sizeof( uint32_t ) );
+  u = calloc( m + 1, sizeof( uint32_t ) );
+  v = calloc( n, sizeof( uint32_t ) );
+
+  // Normalize so the divisor's top limb has its high bit set
+  shift = 0;
+  while ( !( ( v0[ n - 1 ] << shift ) & 0x80000000 ) )
+  {
+    shift++;
+  }
+  for ( i = n - 1; i > 0; i-- )
+  {
+    v[ i ] = ( v0[ i ] << shift ) |
+      ( shift ? ( v0[ i - 1 ] >> ( 32 - shift ) ) : 0 );
+  }
+  v[ 0 ] = v0[ 0 ] << shift;
+  u[ m ] = shift ? ( u0[ m - 1 ] >> ( 32 - shift ) ) : 0;
+  for ( i = m - 1; i > 0; i-- )
+  {
+    u[ i ] = ( u0[ i ] << shift ) |
+      ( shift ? ( u0[ i - 1 ] >> ( 32 - shift ) ) : 0 );
+  }
+  u[ 0 ] = u0[ 0 ] << shift;
+
+  for ( j = m - n; j >= 0; j-- )
+  {
+    // Estimate the quotient digit from the top two limbs
+    uint64_t numerator = ( ( uint64_t ) u[ j + n ] << 32 ) | u[ j + n - 1 ];
+    uint64_t qhat = numerator / v[ n - 1 ];
+    uint64_t rhat = numerator % v[ n - 1 ];
+    int64_t borrow;
+    uint64_t carry;
+
+    while ( qhat > 0xFFFFFFFFULL ||
+            ( n > 1 && qhat * v[ n - 2 ] >
+              ( ( rhat << 32 ) | u[ j + n - 2 ] ) ) )
+    {
+      qhat--;
+      rhat += v[ n - 1 ];
+      if ( rhat > 0xFFFFFFFFULL )
       {
-        quotient->rep[ ( int ) ( bit_position / 8 ) ] |=
-          ( 0x80 >> ( bit_position % 8 ) );
+        break;
       }
     }
 
-    if ( bit_size )
+    // Multiply and subtract
+    borrow = 0;
+    carry = 0;
+    for ( i = 0; i < n; i++ )
     {
-      right_shift( divisor );
+      uint64_t p = qhat * v[ i ] + carry;
+      int64_t t;
+      carry = p >> 32;
+      t = ( int64_t ) u[ i + j ] - ( int64_t ) ( p & 0xFFFFFFFF ) + borrow;
+      u[ i + j ] = ( uint32_t ) t;
+      borrow = t >> 32;
     }
-    bit_position++;
+    {
+      int64_t t = ( int64_t ) u[ j + n ] - ( int64_t ) carry + borrow;
+      u[ j + n ] = ( uint32_t ) t;
+      borrow = t >> 32;
+    }
+
+    // Overshot by one: add the divisor back
+    if ( borrow < 0 )
+    {
+      uint64_t c = 0;
+      qhat--;
+      for ( i = 0; i < n; i++ )
+      {
+        uint64_t t = ( uint64_t ) u[ i + j ] + v[ i ] + c;
+        u[ i + j ] = ( uint32_t ) t;
+        c = t >> 32;
+      }
+      u[ j + n ] += ( uint32_t ) c;
+    }
+    q[ j ] = ( uint32_t ) qhat;
   }
-  while ( bit_size-- );
+
+  // Unnormalize the remainder
+  for ( i = 0; i < n; i++ )
+  {
+    u0[ i ] = ( u[ i ] >> shift ) |
+      ( shift ? ( u[ i + 1 ] << ( 32 - shift ) ) : 0 );
+  }
+  from_limbs( dividend, u0, n );
+
+  if ( quotient )
+  {
+    quotient->rep = NULL;
+    from_limbs( quotient, q, m - n + 1 );
+    quotient->sign = quotient_sign;
+  }
+
+  free( u0 );
+  free( v0 );
+  free( u );
+  free( v );
+  free( q );
 }
 
 /**

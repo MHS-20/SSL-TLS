@@ -26,6 +26,8 @@ check rc4-reference       daf70b86e76454eb975e3bfe2cce339c ./rc4_test -e abcdef 
 check md5            900150983cd24fb0d6963f7d28e17f72 ./digest_test -md5 abc
 check sha1           a9993e364706816aba3e25717850c26c9cd0d89d ./digest_test -sha1 abc
 check sha256         ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ./digest_test -sha256 abc
+check sha384         cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7 ./digest_test -sha384 abc
+check sha512         ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f ./digest_test -sha512 abc
 check hmac-md5       750c783e6ab0b503eaa86e310a5db738 ./hmac_test -md5 Jefe "what do ya want for nothing?"
 check hmac-sha1-long aa4ae5e15272d00e95705637ce8a3b55ed402112 ./hmac_test -sha1 \
   0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \

@@ -4,17 +4,20 @@
 #include "digest.h"
 #include "md5.h"
 #include "sha.h"
+#include "sha512.h"
 #include "hex.h"
 
 void update_digest( digest_ctx *context, const unsigned char *input, int input_len )
 {
+  int block_size = context->block_size;
+
   context->input_len += input_len;
 
   // Process any left over from the last call to "update_digest"
   if ( context->block_len > 0 )
   {
     // How much we need to make a full block
-    int borrow_amt = DIGEST_BLOCK_SIZE - context->block_len;
+    int borrow_amt = block_size - context->block_len;
 
     if ( input_len < borrow_amt )
     {
@@ -32,12 +35,12 @@ void update_digest( digest_ctx *context, const unsigned char *input, int input_l
     }
   }
 
-  while ( input_len >= DIGEST_BLOCK_SIZE )
+  while ( input_len >= block_size )
   {
     context->block_operate( input, context->hash );
 
-    input += DIGEST_BLOCK_SIZE;
-    input_len -= DIGEST_BLOCK_SIZE;
+    input += block_size;
+    input_len -= block_size;
   }
 
   // Have some non-aligned data left over; save it for next call, or
@@ -50,20 +53,22 @@ void update_digest( digest_ctx *context, const unsigned char *input, int input_l
 }
 
 /**
- * Process whatever's left over in the context buffer, append
- * the length in bits, and update the hash one last time.
+ * SHA-384/512 use 128-byte blocks with a 16-byte length.
  */
 void finalize_digest( digest_ctx *context )
 {
-  memset( context->block + context->block_len, 0, DIGEST_BLOCK_SIZE -
+  int block_size = context->block_size;
+  int input_block_size = block_size - block_size / 8;
+
+  memset( context->block + context->block_len, 0, block_size -
     context->block_len );
   context->block[ context->block_len ] = 0x80;
-  // special handling if the last block is < 64 but > 56
-  if ( context->block_len >= INPUT_BLOCK_SIZE )
+  // special handling if the last block is too full to hold the length
+  if ( context->block_len >= input_block_size )
   {
     context->block_operate( context->block, context->hash );
     context->block_len = 0;
-    memset( context->block + context->block_len, 0, DIGEST_BLOCK_SIZE -
+    memset( context->block + context->block_len, 0, block_size -
       context->block_len );
   }
   // Only append the length for the very last block
@@ -83,7 +88,7 @@ int main( int argc, char *argv[ ] )
 
   if ( argc < 3 )
   {
-    fprintf( stderr, "Usage: %s [-md5|-sha1|-sha256] [0x]<input>\n", argv[ 0 ] );
+    fprintf( stderr, "Usage: %s [-md5|-sha1|-sha256|-sha384|-sha512] [0x]<input>\n", argv[ 0 ] );
     exit( 0 );
   }
 
@@ -96,6 +101,14 @@ int main( int argc, char *argv[ ] )
   else if ( !( strcmp( argv[ 1 ], "-sha1" ) ) )
   {
     new_sha1_digest( &ctx );
+  }
+  else if ( !( strcmp( argv[ 1 ], "-sha384" ) ) )
+  {
+    new_sha384_digest( &ctx );
+  }
+  else if ( !( strcmp( argv[ 1 ], "-sha512" ) ) )
+  {
+    new_sha512_digest( &ctx );
   }
   else if ( !( strcmp( argv[ 1 ], "-sha256" ) ) )
   {

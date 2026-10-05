@@ -262,6 +262,7 @@ void new_sha1_digest( digest_ctx *context )
   memset( context->block, '\0', DIGEST_BLOCK_SIZE );
   context->block_operate = sha1_block_operate;
   context->block_finalize = sha1_finalize;
+  context->block_size = DIGEST_BLOCK_SIZE;
 }
 
 void new_sha256_digest( digest_ctx *context )
@@ -276,4 +277,5 @@ void new_sha256_digest( digest_ctx *context )
   memset( context->block, '\0', DIGEST_BLOCK_SIZE );
   context->block_operate = sha256_block_operate;
   context->block_finalize = sha1_finalize;
+  context->block_size = DIGEST_BLOCK_SIZE;
 }
