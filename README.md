@@ -64,3 +64,7 @@ ssl_webserver [port] [-V <max version>] [-cert <file> -key <file> [-pass <passwo
 ## Not implemented
 
 TLS 1.3, X25519, ChaCha20-Poly1305, extended master secret (RFC 7627), session tickets, OCSP/CRL revocation, name constraints and policy checks, constant-time big-number arithmetic. RC4, DES, MD5-based suites and SSLv2 are here for study; don't use them.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
