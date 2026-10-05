@@ -194,6 +194,8 @@ int main( int argc, char *argv[ ] )
   WSADATA wsaData;
 #endif
 
+  init_tls();
+
   if ( argc < 2 )
   {
     fprintf( stderr,

@@ -21,11 +21,13 @@
 #include "privkey.h"
 #include "file.h"
 #include "asn1.h"
+#include "ecc.h"
+#include "ecdsa.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
-static CipherSuite suites[] =
+static CipherSuite suites[ MAX_SUPPORTED_CIPHER_SUITE ] =
 {
   { TLS_NULL_WITH_NULL_NULL, 0, 0, 0, 0, NULL, NULL, NULL },
   { TLS_RSA_WITH_NULL_MD5, 0, 0, 0, MD5_BYTE_SIZE, NULL, NULL, new_md5_digest },
@@ -192,34 +194,37 @@ static int send_message( int connection,
   int send_buffer_size;
   unsigned char padding_length = 0;
   unsigned char *mac = NULL;
+  unsigned char mac_header[ 13 ];
   digest_ctx digest;
   CipherSuite *active_suite;
+  int sequence_num;
 
   active_suite = &suites[ parameters->suite ];
 
+  // Compute the MAC header always, since this will be used
+  // for AEAD or other ciphers: the 8-byte sequence number and the 5-byte
+  // pseudo header.
+  memset( mac_header, '\0', 8 );
+  sequence_num = htonl( parameters->seq_num );
+  memcpy( mac_header + 4, &sequence_num, sizeof( int ) );
+
+  header.type = content_type;
+  header.version.major = TLS_VERSION_MAJOR;
+  header.version.minor = TLS_VERSION_MINOR;
+  header.length = htons( content_len );
+  mac_header[ 8 ] = header.type;
+  mac_header[ 9 ] = header.version.major;
+  mac_header[ 10 ] = header.version.minor;
+  memcpy( mac_header + 11, &header.length, sizeof( short ) );
+
   if ( active_suite->new_digest )
   {
-    // Allocate enough space for the 8-byte sequence number, the 5-byte pseudo
-    // header, and the content.
     unsigned char *mac_buffer = malloc( 13 + content_len );
-    int sequence_num;
 
     mac = ( unsigned char * ) malloc( active_suite->hash_size );
     active_suite->new_digest( &digest );
 
-    memset( mac_buffer, 0x0, 8 );
-    sequence_num = htonl( parameters->seq_num );
-    memcpy( mac_buffer + 4, &sequence_num, sizeof( int ) );
-
-    // These will be overwritten below
-    header.type = content_type;
-    header.version.major = 3;
-    header.version.minor = 1;
-    header.length = htons( content_len );
-    mac_buffer[ 8 ] = header.type;
-    mac_buffer[ 9 ] = header.version.major;
-    mac_buffer[ 10 ] = header.version.minor;
-    memcpy( mac_buffer + 11, &header.length, sizeof( short ) );
+    memcpy( mac_buffer, mac_header, 13 );
     memcpy( mac_buffer + 13, content, content_len );
     hmac( parameters->MAC_secret,
           active_suite->hash_size,
@@ -262,9 +267,6 @@ static int send_message( int connection,
     }
   }
 
-  header.type = content_type;
-  header.version.major = TLS_VERSION_MAJOR;
-  header.version.minor = TLS_VERSION_MINOR;
   header.length = htons( content_len + active_suite->hash_size +
     padding_length );
   send_buffer[ 0 ] = header.type;
@@ -273,15 +275,58 @@ static int send_message( int connection,
   memcpy( send_buffer + 3, &header.length, sizeof( short ) );
   memcpy( send_buffer + 5, content, content_len );
 
-  if ( active_suite->bulk_encrypt )
+  if ( active_suite->bulk_encrypt || active_suite->aead_encrypt )
   {
-    unsigned char *encrypted_buffer = malloc( send_buffer_size );
-    // The first 5 bytes (the header) aren't encrypted
+    unsigned char *encrypted_buffer;
+    int explicit_iv_len = 0;
+
+#if TLS_VERSION_MINOR >= 2
+    // TLS 1.1+ sends the CBC IV in front of each record instead of
+    // chaining it from the previous record
+    if ( active_suite->aead_encrypt )
+    {
+      explicit_iv_len = AEAD_EXPLICIT_NONCE_LEN;
+    }
+    else if ( active_suite->block_size )
+    {
+      explicit_iv_len = active_suite->IV_size;
+    }
+#endif
+
+    encrypted_buffer = malloc( send_buffer_size + explicit_iv_len );
+    // The first 5 bytes (the header) and the IV aren't encrypted
     memcpy( encrypted_buffer, send_buffer, 5 );
-    active_suite->bulk_encrypt( send_buffer + 5, send_buffer_size - 5,
-      encrypted_buffer + 5, parameters->IV, parameters->key );
+    header.length = htons( send_buffer_size - 5 + explicit_iv_len );
+    memcpy( encrypted_buffer + 3, &header.length, sizeof( short ) );
+
+    if ( active_suite->bulk_encrypt )
+    {
+      if ( explicit_iv_len )
+      {
+        // TODO make this random
+        memset( parameters->IV, '\0', explicit_iv_len );
+        memcpy( encrypted_buffer + 5, parameters->IV, explicit_iv_len );
+      }
+      active_suite->bulk_encrypt( send_buffer + 5, send_buffer_size - 5,
+        encrypted_buffer + 5 + explicit_iv_len, parameters->IV,
+        parameters->key );
+    }
+    else
+    {
+      unsigned char nonce[ 12 ];
+
+      memcpy( nonce, parameters->IV, active_suite->IV_size );
+      memcpy( nonce + active_suite->IV_size, mac_header,
+        AEAD_EXPLICIT_NONCE_LEN );
+      memcpy( encrypted_buffer + 5, mac_header, AEAD_EXPLICIT_NONCE_LEN );
+      active_suite->aead_encrypt( send_buffer + 5, content_len,
+        mac_header, 13, encrypted_buffer + 5 + explicit_iv_len,
+        nonce, parameters->key );
+    }
+
     free( send_buffer );
     send_buffer = encrypted_buffer;
+    send_buffer_size += explicit_iv_len;
   }
 
   if ( send( connection, ( void * ) send_buffer,
@@ -320,6 +365,8 @@ static int send_handshake_message( int connection,
 
   update_digest( &parameters->md5_handshake_digest, send_buffer,
     send_buffer_size );
+  update_digest( &parameters->sha256_handshake_digest, send_buffer,
+    send_buffer_size );
   update_digest( &parameters->sha1_handshake_digest, send_buffer,
     send_buffer_size );
 
@@ -355,9 +402,34 @@ void tls_set_client_cipher_suite( unsigned short suite )
 typedef enum
 {
   server_name = 0,
+  elliptic_curves = 10,       // RFC 4492
+  ec_point_formats = 11,      // RFC 4492
+  signature_algorithms = 13,  // RFC 5246
   secure_renegotiation = 0xFF01
 }
 ExtensionType;
+
+typedef enum
+{
+  secp192r1 = 19,
+  secp256r1 = 23
+}
+named_curve;
+
+typedef enum
+{
+  explicit_prime = 1,
+  explicit_char2 = 2,
+  named = 3
+}
+ec_curve_type;
+
+typedef enum
+{
+  compressed = 3,
+  uncompressed = 4
+}
+ec_point_type;
 
 static unsigned short add_renegotiation_extension(
                             unsigned char **renegotiation_extension,
@@ -396,47 +468,72 @@ static unsigned short add_renegotiation_extension(
   }
 }
 
+static unsigned char *append_extension( unsigned char *write_ptr,
+                                        unsigned short type,
+                                        const unsigned char *data,
+                                        unsigned short data_length )
+{
+  unsigned short value;
+
+  value = htons( type );
+  write_ptr = append_buffer( write_ptr, ( void * ) &value,
+    sizeof( unsigned short ) );
+  value = htons( data_length );
+  write_ptr = append_buffer( write_ptr, ( void * ) &value,
+    sizeof( unsigned short ) );
+
+  return append_buffer( write_ptr, ( void * ) data, data_length );
+}
+
 static unsigned short add_client_hello_extensions( unsigned char **extensions,
                                                    TLSParameters *parameters,
                                                    int renegotiating )
 {
   unsigned char *write_ptr;
-  unsigned short extensions_length;
-  unsigned short extension_type;
-  unsigned char *renegotiation_extension;
-  unsigned short renegotiation_extension_length;
-
-  extensions_length = 0;
+  unsigned char *renegotiation_extension = NULL;
+  unsigned short renegotiation_extension_length = 0;
+  // RFC 4492 5.1: the named curves and point formats this client handles.
+  // without them a server can't tell which curve to pick.
+  static const unsigned char supported_curves[] =
+    { 0x00, 0x04, 0x00, secp256r1, 0x00, secp192r1 };
+  static const unsigned char supported_point_formats[] =
+    { 0x01, uncompressed };
+#if TLS_VERSION_MINOR >= 3
+  // RFC 5246 7.4.1.4.1: without this a TLS 1.2 server assumes SHA-1
+  static const unsigned char supported_signature_algorithms[] =
+    { 0x00, 0x08, sha256, sig_rsa, sha256, sig_ecdsa,
+      sha1, sig_rsa, sha1, sig_ecdsa };
+#endif
 
   if ( parameters->support_secure_renegotiation )
   {
     renegotiation_extension_length =
       add_renegotiation_extension( &renegotiation_extension,
         renegotiating, parameters );
-    extensions_length += renegotiation_extension_length +
-      sizeof( unsigned short ) + 2;
   }
 
-  if ( extensions_length )
-  {
-    write_ptr = *extensions = ( unsigned char * ) malloc(
-      extensions_length );
-    memset( *extensions, '\0', extensions_length );
+  // 4 bytes of type and length per extension, plus their data
+  write_ptr = *extensions = ( unsigned char * ) malloc(
+    renegotiation_extension_length + 64 );
 
-    // Insert the renegotiation extension
-    extension_type = htons( secure_renegotiation );
-    write_ptr = append_buffer( write_ptr, ( void * ) &extension_type,
-      sizeof( unsigned short ) );
-    renegotiation_extension_length = htons( renegotiation_extension_length );
-    write_ptr = append_buffer( write_ptr,
-      ( void *) &renegotiation_extension_length,
-      sizeof( unsigned short ) );
-    write_ptr = append_buffer( write_ptr, renegotiation_extension,
-      ntohs( renegotiation_extension_length ) );
+  if ( renegotiation_extension )
+  {
+    write_ptr = append_extension( write_ptr, secure_renegotiation,
+      renegotiation_extension, renegotiation_extension_length );
     free( renegotiation_extension );
   }
 
-  return extensions_length;
+  write_ptr = append_extension( write_ptr, elliptic_curves,
+    supported_curves, sizeof( supported_curves ) );
+  write_ptr = append_extension( write_ptr, ec_point_formats,
+    supported_point_formats, sizeof( supported_point_formats ) );
+#if TLS_VERSION_MINOR >= 3
+  write_ptr = append_extension( write_ptr, signature_algorithms,
+    supported_signature_algorithms,
+    sizeof( supported_signature_algorithms ) );
+#endif
+
+  return write_ptr - *extensions;
 }
 
 /**
@@ -685,8 +782,9 @@ static void calculate_keys( TLSParameters *parameters )
   // XXX assuming send suite & recv suite will always be the same
   CipherSuite *suite = &( suites[ parameters->pending_send_parameters.suite ] );
   const char *label = "key expansion";
+  int mac_key_size = suite->new_digest ? suite->hash_size : 0;
   int key_block_length =
-    suite->hash_size * 2 +
+    mac_key_size * 2 +
     suite->key_size * 2 +
     suite->IV_size * 2;
   char seed[ RANDOM_LENGTH * 2 ];
@@ -704,8 +802,8 @@ static void calculate_keys( TLSParameters *parameters )
     seed, RANDOM_LENGTH * 2,
     key_block, key_block_length );
 
-  send_parameters->MAC_secret = ( unsigned char * ) malloc( suite->hash_size );
-  recv_parameters->MAC_secret = ( unsigned char * ) malloc( suite->hash_size );
+  send_parameters->MAC_secret = ( unsigned char * ) malloc( mac_key_size );
+  recv_parameters->MAC_secret = ( unsigned char * ) malloc( mac_key_size );
   send_parameters->key = ( unsigned char * ) malloc( suite->key_size );
   recv_parameters->key = ( unsigned char * ) malloc( suite->key_size );
   send_parameters->IV = ( unsigned char * ) malloc( suite->IV_size );
@@ -714,9 +812,9 @@ static void calculate_keys( TLSParameters *parameters )
   if ( parameters->connection_end == connection_end_client )
   {
     key_block_ptr = read_buffer( send_parameters->MAC_secret, key_block,
-      suite->hash_size );
+      mac_key_size );
     key_block_ptr = read_buffer( recv_parameters->MAC_secret, key_block_ptr,
-      suite->hash_size );
+      mac_key_size );
     key_block_ptr = read_buffer( send_parameters->key, key_block_ptr,
       suite->key_size );
     key_block_ptr = read_buffer( recv_parameters->key, key_block_ptr,
@@ -729,9 +827,9 @@ static void calculate_keys( TLSParameters *parameters )
   else // I'm the server
   {
     key_block_ptr = read_buffer( recv_parameters->MAC_secret, key_block,
-      suite->hash_size );
+      mac_key_size );
     key_block_ptr = read_buffer( send_parameters->MAC_secret, key_block_ptr,
-      suite->hash_size );
+      mac_key_size );
     key_block_ptr = read_buffer( recv_parameters->key, key_block_ptr,
       suite->key_size );
     key_block_ptr = read_buffer( send_parameters->key, key_block_ptr,
@@ -749,6 +847,7 @@ static void calculate_keys( TLSParameters *parameters )
     case TLS_RSA_WITH_RC4_128_SHA:
     case TLS_DH_anon_EXPORT_WITH_RC4_40_MD5:
     case TLS_DH_anon_WITH_RC4_128_MD5:
+    case TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:
       {
         rc4_state *read_state = malloc( sizeof( rc4_state ) );
         rc4_state *write_state = malloc( sizeof( rc4_state ) );
@@ -858,6 +957,79 @@ int dh_key_exchange( dh_key *server_dh_key,
 }
 
 /**
+ * ECDH counterpart of dh_key_exchange: send A.Q = d * G and
+ * use the x coordinate of d * (server point) as the premaster secret.
+ * premaster_secret must have room for the curve's field size (p.size).
+ */
+int ecdh_key_exchange( point *server_ecdh_key,
+                       elliptic_curve *curve,
+                       unsigned char *premaster_secret,
+                       unsigned char **key_exchange_message )
+{
+  ecc_key A;
+  point K;
+  int coordinate_length = curve->p.size;
+
+  set_huge( &A.d, 4 ); // TODO this should be random, and larger
+  set_huge( &A.Q.x, 0 );
+  set_huge( &A.Q.y, 0 );
+  copy_huge( &A.Q.x, &curve->G.x );
+  copy_huge( &A.Q.y, &curve->G.y );
+  multiply_point( &A.Q, &A.d, &curve->a, &curve->p );
+  contract( &A.Q.x );
+  contract( &A.Q.y );
+
+  // Response is now A.Q; put that into "key_exchange_message" as an
+  // uncompressed X9.62 point, preceded by its one-byte length.
+  *key_exchange_message = ( unsigned char * ) malloc(
+    coordinate_length * 2 + 2 );
+  memset( *key_exchange_message, '\0', coordinate_length * 2 + 2 );
+  (*key_exchange_message)[ 0 ] = coordinate_length * 2 + 1;
+  (*key_exchange_message)[ 1 ] = uncompressed;
+  memcpy( (*key_exchange_message) + 2 + coordinate_length - A.Q.x.size,
+    A.Q.x.rep, A.Q.x.size );
+  memcpy( (*key_exchange_message) + 2 + coordinate_length * 2 - A.Q.y.size,
+    A.Q.y.rep, A.Q.y.size );
+
+  // Now compute the premaster secret from the server's point
+  set_huge( &K.x, 0 );
+  set_huge( &K.y, 0 );
+  copy_huge( &K.x, &server_ecdh_key->x );
+  copy_huge( &K.y, &server_ecdh_key->y );
+  multiply_point( &K, &A.d, &curve->a, &curve->p );
+  contract( &K.x );
+
+  // The premaster secret is K.x, padded to the field size
+  memset( premaster_secret, '\0', coordinate_length );
+  memcpy( premaster_secret + coordinate_length - K.x.size, K.x.rep,
+    K.x.size );
+
+  free_huge( &K.x );
+  free_huge( &K.y );
+  free_huge( &A.d );
+  free_huge( &A.Q.x );
+  free_huge( &A.Q.y );
+
+  return coordinate_length * 2 + 2;
+}
+
+static int is_ecdhe_suite( int suite )
+{
+  switch ( suite )
+  {
+    case TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:
+    case TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:
+    case TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:
+    case TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/**
  * Send the client key exchange message, as detailed in section 7.4.7
  * Use the server's public key (if it has one) to encrypt a key. (or DH?)
  * Return true if this succeeded, false otherwise.
@@ -885,6 +1057,7 @@ static int send_client_key_exchange( int connection, TLSParameters *parameters )
     case TLS_RSA_WITH_3DES_EDE_CBC_SHA:
     case TLS_RSA_WITH_AES_128_CBC_SHA:
     case TLS_RSA_WITH_AES_256_CBC_SHA:
+    case TLS_RSA_WITH_AES_128_GCM_SHA256:
       premaster_secret_len = MASTER_SECRET_LENGTH;
       premaster_secret = malloc( premaster_secret_len );
       key_exchange_message_len = rsa_key_exchange(
@@ -922,6 +1095,18 @@ static int send_client_key_exchange( int connection, TLSParameters *parameters )
       premaster_secret = malloc( premaster_secret_len );
       key_exchange_message_len = dh_key_exchange( &parameters->server_dh_key,
         premaster_secret, &premaster_secret_len, &key_exchange_message );
+      break;
+    case TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:
+    case TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:
+    case TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:
+    case TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:
+    case TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:
+      premaster_secret_len = parameters->server_ecdh_params.p.size;
+      premaster_secret = malloc( premaster_secret_len );
+      key_exchange_message_len = ecdh_key_exchange(
+        &parameters->server_ecdh_key, &parameters->server_ecdh_params,
+        premaster_secret, &key_exchange_message );
       break;
     default:
       return 0;
@@ -971,9 +1156,29 @@ static int send_change_cipher_spec( int connection, TLSParameters *parameters )
   return 1;
 }
 
-void compute_handshake_hash( TLSParameters *parameters,
-                             unsigned char *handshake_hash )
+/**
+ * Finalize a copy of the running handshake digest(s) into handshake_hash
+ * and return its length: MD5 + SHA-1 (36 bytes) for TLS 1.0, SHA-256
+ * (32 bytes) for TLS 1.2.
+ */
+int compute_handshake_hash( TLSParameters *parameters,
+                            unsigned char *handshake_hash )
 {
+#if TLS_VERSION_MINOR >= 3
+  digest_ctx tmp_sha256_handshake_digest;
+
+  memcpy( &tmp_sha256_handshake_digest, &parameters->sha256_handshake_digest,
+    sizeof( digest_ctx ) );
+  tmp_sha256_handshake_digest.hash =
+    ( unsigned int * ) malloc( SHA256_BYTE_SIZE );
+  memcpy( tmp_sha256_handshake_digest.hash,
+    parameters->sha256_handshake_digest.hash, SHA256_BYTE_SIZE );
+  finalize_digest( &tmp_sha256_handshake_digest );
+  memcpy( handshake_hash, tmp_sha256_handshake_digest.hash, SHA256_BYTE_SIZE );
+  free( tmp_sha256_handshake_digest.hash );
+
+  return SHA256_BYTE_SIZE;
+#else
   digest_ctx tmp_md5_handshake_digest;
   digest_ctx tmp_sha1_handshake_digest;
 
@@ -1001,6 +1206,9 @@ void compute_handshake_hash( TLSParameters *parameters,
 
   free( tmp_md5_handshake_digest.hash );
   free( tmp_sha1_handshake_digest.hash );
+
+  return MD5_BYTE_SIZE + SHA1_BYTE_SIZE;
+#endif
 }
 
 /**
@@ -1021,13 +1229,14 @@ static void compute_verify_data( const char *finished_label,
   unsigned char handshake_hash[ ( MD5_RESULT_SIZE * sizeof( int ) ) +
                                 ( SHA1_RESULT_SIZE * sizeof( int ) ) ];
 
-  compute_handshake_hash( parameters, handshake_hash );
+  int handshake_hash_len;
+
+  handshake_hash_len = compute_handshake_hash( parameters, handshake_hash );
 
   // First, compute the verify data
   PRF( parameters->master_secret, MASTER_SECRET_LENGTH,
        finished_label, strlen( finished_label ),
-       handshake_hash,
-       MD5_RESULT_SIZE * sizeof( int ) + SHA1_RESULT_SIZE * sizeof( int ),
+       handshake_hash, handshake_hash_len,
        verify_data, VERIFY_DATA_LEN );
 }
 
@@ -1174,6 +1383,43 @@ StoredSessionsList;
 
 static StoredSessionsList *stored_sessions[ HASH_TABLE_SIZE ];
 
+static void init_cipher_suite( CipherSuiteIdentifier id,
+                               int block_size,
+                               int IV_size,
+                               int key_size,
+                               int hash_size,
+                               void (*bulk_encrypt)( const unsigned char *,
+                                 const int, unsigned char[], void *,
+                                 const unsigned char * ),
+                               void (*bulk_decrypt)( const unsigned char *,
+                                 const int, unsigned char[], void *,
+                                 const unsigned char * ),
+                               void (*new_digest)( digest_ctx * ),
+                               int (*aead_encrypt)( const unsigned char *,
+                                 const int, const unsigned char *, const int,
+                                 unsigned char[], void *,
+                                 const unsigned char * ),
+                               int (*aead_decrypt)( const unsigned char *,
+                                 const int, const unsigned char *, const int,
+                                 unsigned char[], void *,
+                                 const unsigned char * ) )
+{
+  suites[ id ].id = id;
+  suites[ id ].block_size = block_size;
+  suites[ id ].IV_size = IV_size;
+  suites[ id ].key_size = key_size;
+  suites[ id ].hash_size = hash_size;
+  suites[ id ].bulk_encrypt = bulk_encrypt;
+  suites[ id ].bulk_decrypt = bulk_decrypt;
+  suites[ id ].new_digest = new_digest;
+  suites[ id ].aead_encrypt = aead_encrypt;
+  suites[ id ].aead_decrypt = aead_decrypt;
+}
+
+/**
+ * Must be called once at startup, by clients and servers: sets up the
+ * session cache and the cipher suites past 0x3A.
+ */
 void init_tls()
 {
   int i = 0;
@@ -1181,6 +1427,28 @@ void init_tls()
   {
     stored_sessions[ i ] = NULL;
   }
+
+  // Extra cipher suites not previously declared
+  init_cipher_suite( TLS_RSA_WITH_AES_128_GCM_SHA256, 0, 4, 16, 16,
+    NULL, NULL, NULL, aes_gcm_encrypt, aes_gcm_decrypt );
+  init_cipher_suite( TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, 0, 0, 16,
+    SHA1_BYTE_SIZE, rc4_128_encrypt, rc4_128_decrypt, new_sha1_digest,
+    NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA, 8, 8, 24,
+    SHA1_BYTE_SIZE, des3_encrypt, des3_decrypt, new_sha1_digest,
+    NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, 16, 16, 16,
+    SHA1_BYTE_SIZE, aes_128_encrypt, aes_128_decrypt, new_sha1_digest,
+    NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, 16, 16, 32,
+    SHA1_BYTE_SIZE, aes_256_encrypt, aes_256_decrypt, new_sha1_digest,
+    NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, 16, 16, 16,
+    SHA1_BYTE_SIZE, aes_128_encrypt, aes_128_decrypt, new_sha1_digest,
+    NULL, NULL );
+  init_cipher_suite( TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, 16, 16, 32,
+    SHA1_BYTE_SIZE, aes_256_encrypt, aes_256_decrypt, new_sha1_digest,
+    NULL, NULL );
 }
 
 /**
@@ -1255,6 +1523,29 @@ static void find_stored_session( int session_id_length,
   }
 }
 
+/**
+ * the server only implements RSA key exchange.
+ */
+static int server_supports_suite( unsigned short id )
+{
+  switch ( id )
+  {
+    case TLS_RSA_WITH_RC4_128_MD5:
+    case TLS_RSA_WITH_RC4_128_SHA:
+    case TLS_RSA_WITH_DES_CBC_SHA:
+    case TLS_RSA_WITH_3DES_EDE_CBC_SHA:
+    case TLS_RSA_WITH_AES_128_CBC_SHA:
+    case TLS_RSA_WITH_AES_256_CBC_SHA:
+      return 1;
+#if TLS_VERSION_MINOR >= 3
+    case TLS_RSA_WITH_AES_128_GCM_SHA256:
+      return 1;
+#endif
+    default:
+      return 0;
+  }
+}
+
 static char *parse_client_hello( char *read_pos,
                                  int pdu_length,
                                  TLSParameters *parameters )
@@ -1303,8 +1594,7 @@ static char *parse_client_hello( char *read_pos,
   for ( i = 0; i < hello.cipher_suites_length / 2; i++ )
   {
     hello.cipher_suites[ i ] = ntohs( hello.cipher_suites[ i ] );
-    if ( hello.cipher_suites[ i ] < MAX_SUPPORTED_CIPHER_SUITE &&
-         suites[ hello.cipher_suites[ i ] ].bulk_encrypt != NULL )
+    if ( server_supports_suite( hello.cipher_suites[ i ] ) )
     {
       parameters->pending_recv_parameters.suite = hello.cipher_suites[ i ];
       parameters->pending_send_parameters.suite = hello.cipher_suites[ i ];
@@ -1357,8 +1647,8 @@ static int send_server_hello( int connection, TLSParameters *parameters )
   void *write_buffer;
   time_t local_time;
 
-  package.server_version.major = 3;
-  package.server_version.minor = 1;
+  package.server_version.major = TLS_VERSION_MAJOR;
+  package.server_version.minor = TLS_VERSION_MINOR;
   time( &local_time );
   package.random.gmt_unix_time = htonl( local_time );
   // TODO - actually make this random.
@@ -1537,31 +1827,100 @@ static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
   return read_pos + pdu_length;
 }
 
+#if TLS_VERSION_MINOR >= 3
+static const unsigned char OID_sha1[] =
+  { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+static const unsigned char OID_sha256[] =
+  { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+#endif
+
+/**
+ * Verify the signature on a server key exchange: a hash of client random,
+ * server random and the key exchange parameters. hash_alg is only used by
+ * TLS 1.2, where the signature names its own hash.
+ */
 static int verify_signature( unsigned char *message,
                              int message_len,
                              unsigned char *signature,
                              int signature_len,
+                             HashAlgorithm hash_alg,
                              TLSParameters *parameters )
 {
-  // This is needed for RSA or DSA
-  digest_ctx sha1_digest;
+  // This is needed for RSA, DSA or ECDSA
+  digest_ctx sha_digest;
 
-  new_sha1_digest( &sha1_digest );
-  update_digest( &sha1_digest, parameters->client_random, RANDOM_LENGTH );
-  update_digest( &sha1_digest, parameters->server_random, RANDOM_LENGTH );
-  update_digest( &sha1_digest, message, message_len );
-  finalize_digest( &sha1_digest );
+#if TLS_VERSION_MINOR >= 3
+  switch ( hash_alg )
+  {
+    case sha1:
+      new_sha1_digest( &sha_digest );
+      break;
+    case sha256:
+      new_sha256_digest( &sha_digest );
+      break;
+    default:
+      fprintf( stderr, "Unsupported signature hash algorithm %d\n", hash_alg );
+      return 0;
+  }
+#else
+  new_sha1_digest( &sha_digest );
+#endif
+  update_digest( &sha_digest, parameters->client_random, RANDOM_LENGTH );
+  update_digest( &sha_digest, parameters->server_random, RANDOM_LENGTH );
+  update_digest( &sha_digest, message, message_len );
+  finalize_digest( &sha_digest );
 
   if ( parameters->server_public_key.algorithm == rsa )
   {
     unsigned char *decrypted_signature;
     int decrypted_signature_length;
+#if TLS_VERSION_MINOR >= 3
+    struct asn1struct rsa_signature;
+    struct asn1struct *hash_oid;
+    struct asn1struct *hash_value;
+    int valid;
+#else
     digest_ctx md5_digest;
+#endif
 
     decrypted_signature_length = rsa_decrypt( signature, signature_len,
       &decrypted_signature,
       &parameters->server_public_key.rsa_public_key );
 
+    if ( decrypted_signature_length < 0 )
+    {
+      return 0;
+    }
+
+#if TLS_VERSION_MINOR >= 3
+    // TLS 1.2; no longer includes MD-5, just one hash,
+    // but the RSA signature also includes the signature scheme,
+    // so must be DER-decoded
+    if ( asn1parse( decrypted_signature, decrypted_signature_length,
+                    &rsa_signature ) )
+    {
+      free( decrypted_signature );
+      return 0;
+    }
+
+    hash_oid = rsa_signature.children->children;
+    hash_value = rsa_signature.children->next;
+    valid = ( hash_value->length == sha_digest.hash_len * sizeof( int ) ) &&
+      ( hash_alg == sha256 ?
+        ( hash_oid->length == sizeof( OID_sha256 ) &&
+          !memcmp( hash_oid->data, OID_sha256, sizeof( OID_sha256 ) ) ) :
+        ( hash_oid->length == sizeof( OID_sha1 ) &&
+          !memcmp( hash_oid->data, OID_sha1, sizeof( OID_sha1 ) ) ) ) &&
+      !memcmp( sha_digest.hash, hash_value->data, hash_value->length );
+
+    asn1free( &rsa_signature );
+    free( decrypted_signature );
+
+    if ( !valid )
+    {
+      return 0;
+    }
+#else
     // If the signature algorithm is RSA, this will be the md5 hash, followed by
     // the sha-1 hash of: client random, server random, params).
     // If DSA, this will just be the sha-1 hash
@@ -1571,22 +1930,28 @@ static int verify_signature( unsigned char *message,
     update_digest( &md5_digest, message, message_len );
     finalize_digest( &md5_digest );
 
-    if ( decrypted_signature_length < 0 ||
-         memcmp( md5_digest.hash, decrypted_signature, MD5_BYTE_SIZE ) ||
-         memcmp( sha1_digest.hash, decrypted_signature + MD5_BYTE_SIZE,
+    if ( memcmp( md5_digest.hash, decrypted_signature, MD5_BYTE_SIZE ) ||
+         memcmp( sha_digest.hash, decrypted_signature + MD5_BYTE_SIZE,
                  SHA1_BYTE_SIZE ) )
     {
+      free( decrypted_signature );
       return 0;
     }
 
     free( decrypted_signature );
+#endif
   }
-  else if ( parameters->server_public_key.algorithm == dsa )
+  else if ( ( parameters->server_public_key.algorithm == dsa ) ||
+            ( parameters->server_public_key.algorithm == ecdsa ) )
   {
     struct asn1struct decoded_signature;
     dsa_signature received_signature;
+    int verified;
 
-    asn1parse( signature, signature_len, &decoded_signature );
+    if ( asn1parse( signature, signature_len, &decoded_signature ) )
+    {
+      return 0;
+    }
 
     set_huge( &received_signature.r, 0 );
     set_huge( &received_signature.s, 0 );
@@ -1595,23 +1960,39 @@ static int verify_signature( unsigned char *message,
     load_huge( &received_signature.s,
       decoded_signature.children->next->data,
       decoded_signature.children->next->length );
+    contract( &received_signature.r );
+    contract( &received_signature.s );
 
     asn1free( &decoded_signature );
 
-    if ( !dsa_verify( &parameters->server_public_key.dsa_parameters,
-                      &parameters->server_public_key.dsa_public_key,
-                      sha1_digest.hash,
-                      SHA1_BYTE_SIZE,
-                      &received_signature ) )
+    if ( parameters->server_public_key.algorithm == dsa )
     {
-      free_huge( &received_signature.r );
-      free_huge( &received_signature.s );
-      return 0;
+      verified = dsa_verify( &parameters->server_public_key.dsa_parameters,
+                             &parameters->server_public_key.dsa_public_key,
+                             sha_digest.hash,
+                             SHA1_BYTE_SIZE,
+                             &received_signature );
+    }
+    else
+    {
+      verified = ecdsa_verify( &parameters->server_public_key.ecdsa_curve,
+                               &parameters->server_public_key.ecdsa_public_key,
+                               sha_digest.hash,
+                               sha_digest.hash_len,
+                               &received_signature );
     }
 
     free_huge( &received_signature.r );
     free_huge( &received_signature.s );
+
+    if ( !verified )
+    {
+      free( sha_digest.hash );
+      return 0;
+    }
   }
+
+  free( sha_digest.hash );
 
   return 1;
 }
@@ -1623,38 +2004,101 @@ static char *parse_server_key_exchange( unsigned char *read_pos,
   short length;
   int i;
   unsigned char *dh_params = read_pos;
+  HashAlgorithm hash_alg = sha1; // implied before TLS 1.2
+  SignatureAlgorithm sig_alg;
 
-  for ( i = 0; i < 4; i++ )
+  if ( is_ecdhe_suite( parameters->pending_send_parameters.suite ) )
   {
-    if ( i == 3 && ( read_pos - dh_params ) >= pdu_length )
+    unsigned char curve_type;
+    unsigned short curve;
+    unsigned char public_key_length;
+    unsigned char point_type;
+
+    read_pos = read_buffer( ( void * ) &curve_type, read_pos, 1 );
+    switch ( curve_type )
     {
-      break;
+      case named:
+        read_pos = read_buffer( ( void * ) &curve, read_pos, 2 );
+        curve = ntohs( curve );
+        switch ( curve )
+        {
+          case secp256r1:
+            get_named_curve( "prime256v1", &parameters->server_ecdh_params );
+            break;
+          case secp192r1:
+            get_named_curve( "prime192v1", &parameters->server_ecdh_params );
+            break;
+          default:
+            fprintf( stderr, "error, unsupported named curve %d\n", curve );
+            return NULL;
+        }
+        break;
+      default:
+        fprintf( stderr, "Error, unsupported curve type %d.\n", curve_type );
+        return NULL;
     }
+
+    // Followed by a length-delimited (opaque) public key.
+    read_pos = read_buffer( ( void * ) &public_key_length, read_pos, 1 );
+    read_pos = read_buffer( ( void * ) &point_type, read_pos, 1 );
+    if ( point_type != uncompressed )
+    {
+      fprintf( stderr, "Error, compressed ECDH public keys not supported.\n" );
+      return NULL;
+    }
+
+    load_huge( &parameters->server_ecdh_key.x, read_pos,
+      ( public_key_length - 1 ) / 2 );
+    load_huge( &parameters->server_ecdh_key.y,
+      ( read_pos + ( ( public_key_length - 1 ) / 2 ) ),
+      ( ( public_key_length - 1 ) / 2 ) );
+    read_pos += ( public_key_length - 1 );
+  }
+  else
+  {
+    // DHE: p, g and Ys, each preceded by its length
+    for ( i = 0; i < 3; i++ )
+    {
+      memcpy( &length, read_pos, 2 );
+      length = ntohs( length );
+      read_pos += 2;
+
+      switch ( i )
+      {
+        case 0:
+          load_huge( &parameters->server_dh_key.p, read_pos, length );
+          break;
+        case 1:
+          load_huge( &parameters->server_dh_key.g, read_pos, length );
+          break;
+        case 2:
+          load_huge( &parameters->server_dh_key.Y, read_pos, length );
+          break;
+      }
+      read_pos += length;
+    }
+  }
+
+  // The signature over the parameters, including their length bytes,
+  // follows them. DH_anon suites don't send one.
+  if ( ( read_pos - dh_params ) < pdu_length )
+  {
+    int params_length = read_pos - dh_params;
+
+#if TLS_VERSION_MINOR >= 3
+    hash_alg = read_pos[ 0 ];
+    sig_alg = read_pos[ 1 ];
+    read_pos += 2;
+#endif
+
     memcpy( &length, read_pos, 2 );
     length = ntohs( length );
     read_pos += 2;
 
-    switch ( i )
+    if ( !verify_signature( dh_params, params_length, read_pos, length,
+                            hash_alg, parameters ) )
     {
-      case 0:
-        load_huge( &parameters->server_dh_key.p, read_pos, length );
-        break;
-      case 1:
-        load_huge( &parameters->server_dh_key.g, read_pos, length );
-        break;
-      case 2:
-        load_huge( &parameters->server_dh_key.Y, read_pos, length );
-        break;
-      case 3:
-        // The third element is the signature over the first three, including their
-        // length bytes
-        if ( !verify_signature( dh_params,
-              ( read_pos - 2 - dh_params ),
-              read_pos, length, parameters ) )
-        {
-          return NULL;
-        }
-        break;
+      return NULL;
     }
     read_pos += length;
   }
@@ -1673,10 +2117,22 @@ typedef enum
 }
 certificate_type;
 
+#define MAX_SIGNATURE_ALGORITHMS 28
+
+typedef struct
+{
+  HashAlgorithm hash;
+  SignatureAlgorithm signature;
+}
+SignatureAndHashAlgorithm;
+
 typedef struct
 {
   unsigned char certificate_types_count;
   certificate_type supported_certificate_types[ MAX_CERTIFICATE_TYPES ];
+  unsigned short signature_algorithms_count;
+  SignatureAndHashAlgorithm
+    supported_signature_algorithms[ MAX_SIGNATURE_ALGORITHMS ];
 }
 CertificateRequest;
 
@@ -1698,6 +2154,30 @@ static unsigned char *parse_certificate_request( unsigned char *read_pos,
       request.supported_certificate_types[ i ] = type;
     }
   }
+
+#if TLS_VERSION_MINOR >= 3
+  {
+    unsigned short signature_algorithms_length;
+
+    read_pos = read_buffer( ( void * ) &signature_algorithms_length,
+      read_pos, 2 );
+    signature_algorithms_length = ntohs( signature_algorithms_length );
+    request.signature_algorithms_count = 0;
+    for ( i = 0; i < signature_algorithms_length / 2; i++ )
+    {
+      unsigned char hash, signature;
+
+      read_pos = read_buffer( ( void * ) &hash, read_pos, 1 );
+      read_pos = read_buffer( ( void * ) &signature, read_pos, 1 );
+      if ( i < MAX_SIGNATURE_ALGORITHMS )
+      {
+        request.supported_signature_algorithms[ i ].hash = hash;
+        request.supported_signature_algorithms[ i ].signature = signature;
+        request.signature_algorithms_count++;
+      }
+    }
+  }
+#endif
 
   read_pos = read_buffer( ( void * ) &trusted_roots_length, read_pos, 2 );
   trusted_roots_length = htons( trusted_roots_length );
@@ -1849,6 +2329,19 @@ static int tls_decrypt( const unsigned char *header, // needed for MAC verificat
 
   if ( active_suite->bulk_decrypt )
   {
+#if TLS_VERSION_MINOR >= 2
+    // TLS 1.1+: the first IV_size bytes of a block-ciphered record are its IV
+    if ( active_suite->block_size )
+    {
+      if ( encrypted_length < active_suite->IV_size )
+      {
+        return -1;
+      }
+      memcpy( parameters->IV, encrypted_message, active_suite->IV_size );
+      encrypted_message += active_suite->IV_size;
+      encrypted_length -= active_suite->IV_size;
+    }
+#endif
     active_suite->bulk_decrypt( encrypted_message, encrypted_length,
       *decrypted_message, parameters->IV, parameters->key );
     decrypted_length = encrypted_length;
@@ -1856,6 +2349,41 @@ static int tls_decrypt( const unsigned char *header, // needed for MAC verificat
     if ( active_suite->block_size )
     {
       decrypted_length -= ( (*decrypted_message)[ encrypted_length - 1 ] + 1 );
+    }
+  }
+  else if ( active_suite->aead_decrypt )
+  {
+    unsigned char nonce[ 12 ];
+    unsigned char mac_header[ 13 ];
+
+    if ( encrypted_length < AEAD_EXPLICIT_NONCE_LEN + active_suite->hash_size )
+    {
+      return -1;
+    }
+
+    memcpy( nonce, parameters->IV, active_suite->IV_size );
+    memcpy( nonce + active_suite->IV_size, encrypted_message,
+      AEAD_EXPLICIT_NONCE_LEN );
+    decrypted_length = encrypted_length - AEAD_EXPLICIT_NONCE_LEN -
+      active_suite->hash_size;
+
+    // Compute the MAC header, which is the AD part. This
+    // has to be done separately here, since the length computation
+    // is slightly different than in the block cipher case
+    memset( mac_header, 0x0, 13 );
+    sequence_number = htonl( parameters->seq_num );
+    memcpy( mac_header + 4, &sequence_number, sizeof( int ) );
+    memcpy( mac_header + 8, header, 3 );
+    length = htons( decrypted_length );
+    memcpy( mac_header + 11, &length, 2 );
+
+    if ( active_suite->aead_decrypt(
+           encrypted_message + AEAD_EXPLICIT_NONCE_LEN,
+           encrypted_length - AEAD_EXPLICIT_NONCE_LEN, mac_header, 13,
+           *decrypted_message, nonce, parameters->key ) )
+    {
+      // MAC verification failed
+      return -1;
     }
   }
   else
@@ -2138,6 +2666,8 @@ static int receive_tls_msg( int connection,
         handshake.length + 4 );
       update_digest( &parameters->sha1_handshake_digest, handshake_msg_start,
         handshake.length + 4 );
+      update_digest( &parameters->sha256_handshake_digest, handshake_msg_start,
+        handshake.length + 4 );
     }
   }
   else if ( message.type == content_alert )
@@ -2225,8 +2755,31 @@ static int send_certificate_verify( int connection,
   unsigned char *certificate_verify_message;
   unsigned char handshake_hash[ ( MD5_RESULT_SIZE * sizeof( int ) ) +
                                 ( SHA1_RESULT_SIZE * sizeof( int ) ) ];
+  int handshake_hash_len;
+  unsigned char *signed_data;
+  int signed_data_len;
+  int header_len = 0;
+#if TLS_VERSION_MINOR >= 3
+  // DER DigestInfo header for a SHA-256 hash (RFC 3447 9.2)
+  static const unsigned char sha256_digest_info[] = { 0x30, 0x31, 0x30, 0x0d,
+    0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20 };
+  unsigned char digest_info[ sizeof( sha256_digest_info ) + SHA256_BYTE_SIZE ];
+#endif
 
-  compute_handshake_hash( parameters, handshake_hash );
+  handshake_hash_len = compute_handshake_hash( parameters, handshake_hash );
+  signed_data = handshake_hash;
+  signed_data_len = handshake_hash_len;
+#if TLS_VERSION_MINOR >= 3
+  // TLS 1.2 signs a DigestInfo of the SHA-256 handshake
+  // hash and declares the algorithms in front of the signature
+  memcpy( digest_info, sha256_digest_info, sizeof( sha256_digest_info ) );
+  memcpy( digest_info + sizeof( sha256_digest_info ), handshake_hash,
+    SHA256_BYTE_SIZE );
+  signed_data = digest_info;
+  signed_data_len = sizeof( digest_info );
+  header_len = 2;
+#endif
 
   if ( !( buffer = load_file_into_memory( "key.der", &buffer_length ) ) )
   {
@@ -2237,21 +2790,25 @@ static int send_certificate_verify( int connection,
   parse_private_key( &private_key, buffer, buffer_length );
   free( buffer );
 
-  handshake_signature_len = ( unsigned short ) rsa_sign( handshake_hash,
-    MD5_BYTE_SIZE + SHA1_BYTE_SIZE, &handshake_signature,
-    &private_key );
+  handshake_signature_len = ( unsigned short ) rsa_sign( signed_data,
+    signed_data_len, &handshake_signature, &private_key );
 
-  certificate_verify_message_len = handshake_signature_len +
+  certificate_verify_message_len = header_len + handshake_signature_len +
     sizeof( unsigned short );
   certificate_verify_message = ( unsigned char * )
     malloc( certificate_verify_message_len );
 
+#if TLS_VERSION_MINOR >= 3
+  certificate_verify_message[ 0 ] = sha256;
+  certificate_verify_message[ 1 ] = sig_rsa;
+#endif
+
   // copying this "backwards" so that I can use the signature len
   // as a numeric input but then htons it to send on.
-  memcpy( ( void * ) ( certificate_verify_message + 2 ),
+  memcpy( ( void * ) ( certificate_verify_message + header_len + 2 ),
     ( void * ) handshake_signature, handshake_signature_len );
   handshake_signature_len = htons( handshake_signature_len );
-  memcpy( ( void * ) certificate_verify_message,
+  memcpy( ( void * ) certificate_verify_message + header_len,
     ( void * ) &handshake_signature_len, sizeof( unsigned short ) );
 
   send_handshake_message( connection, certificate_verify,
@@ -2274,6 +2831,7 @@ int tls_connect( int connection,
   parameters->connection_end = connection_end_client;
   new_md5_digest( &parameters->md5_handshake_digest );
   new_sha1_digest( &parameters->sha1_handshake_digest );
+  new_sha256_digest( &parameters->sha256_handshake_digest );
 
   // Step 1. Send the TLS handshake "client hello" message
   if ( send_client_hello( connection, parameters, renegotiate ) < 0 )
@@ -2353,6 +2911,7 @@ int tls_accept( int connection,
 
   new_md5_digest( &parameters->md5_handshake_digest );
   new_sha1_digest( &parameters->sha1_handshake_digest );
+  new_sha256_digest( &parameters->sha256_handshake_digest );
 
   // The client sends the first message
   parameters->got_client_hello = 0;
@@ -2493,6 +3052,7 @@ int tls_resume( int connection,
 
   new_md5_digest( &parameters->md5_handshake_digest );
   new_sha1_digest( &parameters->sha1_handshake_digest );
+  new_sha256_digest( &parameters->sha256_handshake_digest );
 
   // Send the TLS handshake "client hello" message
   if ( send_client_hello( connection, parameters, 0 ) < 0 )

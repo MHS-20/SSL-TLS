@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <assert.h>
 #include "x509.h"
+#include "ecdsa.h"
 #include "asn1.h"
 #include "md5.h"
 #include "sha.h"
@@ -79,6 +80,8 @@ static const unsigned char OID_sha1WithRSA[] =
   { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05 };
 static const unsigned char OID_sha1WithDSA[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03 };
+static const unsigned char OID_sha256WithECDSA[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
 
 static int parse_algorithm_identifier( signatureAlgorithmIdentifier *target,
                                        struct asn1struct *source )
@@ -96,6 +99,10 @@ static int parse_algorithm_identifier( signatureAlgorithmIdentifier *target,
   else if ( !memcmp( oid->data, OID_sha1WithDSA, oid->length ) )
   {
     *target = shaWithDSA;
+  }
+  else if ( !memcmp( oid->data, OID_sha256WithECDSA, oid->length ) )
+  {
+    *target = sha256WithECDSA;
   }
   else
   {
@@ -261,6 +268,16 @@ static const unsigned char OID_RSA[] =
   { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
 static const unsigned char OID_DSA[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x01 };
+static const unsigned char OID_DH[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3E, 0x02, 0x01 };
+static const unsigned char OID_ECDSA[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+// A.K.A. secp192R1, AKA NIST P-192
+static const unsigned char OID_PRIME192V1[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x01 };
+// A.K.A. secp256R1, AKA NIST P-256 
+static const unsigned char OID_PRIME256V1[] =
+  { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
 
 static int parse_public_key_info( public_key_info *target,
                                   struct asn1struct *source )
@@ -271,6 +288,46 @@ static int parse_public_key_info( public_key_info *target,
 
   oid = source->children->children;
   public_key = source->children->next;
+
+  if ( !memcmp( oid->data, &OID_ECDSA, sizeof( OID_ECDSA ) ) )
+  {
+    // TODO this only supports named curves.
+    struct asn1struct *curve = oid->next;
+    target->algorithm = ecdsa;
+
+    if ( !memcmp( curve->data, &OID_PRIME192V1, sizeof( OID_PRIME192V1 ) ) )
+    {
+      // TODO generate a mapping of OIDs to curve names
+      if ( get_named_curve( "prime192v1", &target->ecdsa_curve ) )
+      {
+        return 1;
+      }
+    }
+    else if ( !memcmp( curve->data, &OID_PRIME256V1,
+                       sizeof( OID_PRIME256V1 ) ) )
+    {
+      if ( get_named_curve( "prime256v1", &target->ecdsa_curve ) )
+      {
+        return 1;
+      }
+    }
+    else
+    {
+      fprintf( stderr,
+        "Error, unsupported named curve in ECDSA certificate\n" );
+      return 1;
+    }
+
+    // Skip the bit string's leading 0 byte and the X9.62
+    // compressed/uncompressed marker; the rest is x followed by y.
+    load_huge( &target->ecdsa_public_key.x, public_key->data + 2,
+      ( public_key->length - 2 ) / 2 );
+    load_huge( &target->ecdsa_public_key.y,
+      ( public_key->data + 2 ) + ( ( public_key->length - 2 ) / 2 ),
+      ( public_key->length - 2 ) / 2 );
+
+    return 0;
+  }
 
   // The public key is a bit string encoding yet another ASN.1 DER-encoded
   // value - need to parse *that* here
@@ -452,6 +509,8 @@ static int parse_dsa_signature_value( signed_x509_certificate *target,
 
   parse_huge( &target->dsa_signature_value.r, dsa_signature.children );
   parse_huge( &target->dsa_signature_value.s, dsa_signature.children->next );
+  contract( &target->dsa_signature_value.r );
+  contract( &target->dsa_signature_value.s );
 
   asn1free( &dsa_signature );
 
@@ -497,6 +556,7 @@ int parse_x509_certificate( const unsigned char *buffer,
       }
       break;
     case shaWithDSA:
+    case sha256WithECDSA:
       if ( parse_dsa_signature_value( parsed_certificate, signatureValue ) )
       {
         return 42;
@@ -512,6 +572,9 @@ int parse_x509_certificate( const unsigned char *buffer,
     case shaWithRSAEncryption:
     case shaWithDSA:
       new_sha1_digest( &digest );
+      break;
+    case sha256WithECDSA:
+      new_sha256_digest( &digest );
       break;
     default:
       break;
@@ -607,6 +670,32 @@ char *parse_x509_chain( unsigned char *buffer,
           copy_huge( &server_public_key->dsa_public_key,
             &certificate.tbsCertificate.subjectPublicKeyInfo.dsa_public_key );
           break;
+        case ecdsa:
+          set_huge( &server_public_key->ecdsa_curve.a, 0 );
+          set_huge( &server_public_key->ecdsa_curve.b, 0 );
+          set_huge( &server_public_key->ecdsa_curve.G.x, 0 );
+          set_huge( &server_public_key->ecdsa_curve.G.y, 0 );
+          set_huge( &server_public_key->ecdsa_curve.p, 0 );
+          set_huge( &server_public_key->ecdsa_curve.n, 0 );
+          set_huge( &server_public_key->ecdsa_public_key.x, 0 );
+          set_huge( &server_public_key->ecdsa_public_key.y, 0 );
+          copy_huge( &server_public_key->ecdsa_curve.a,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.a );
+          copy_huge( &server_public_key->ecdsa_curve.b,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.b );
+          copy_huge( &server_public_key->ecdsa_curve.G.x,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.G.x );
+          copy_huge( &server_public_key->ecdsa_curve.G.y,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.G.y );
+          copy_huge( &server_public_key->ecdsa_curve.p,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.p );
+          copy_huge( &server_public_key->ecdsa_curve.n,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_curve.n );
+          copy_huge( &server_public_key->ecdsa_public_key.x,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key.x );
+          copy_huge( &server_public_key->ecdsa_public_key.y,
+            &certificate.tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key.y );
+          break;
         default:
           // Diffie-Hellman certificates not supported in this implementation
           break;
@@ -680,6 +769,16 @@ static int validate_certificate_dsa( signed_x509_certificate *certificate )
     &certificate->dsa_signature_value );
 }
 
+static int validate_certificate_ecdsa( signed_x509_certificate *certificate )
+{
+  return ecdsa_verify(
+    &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_curve,
+    &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key,
+    certificate->hash,
+    certificate->hash_len * 4,
+    &certificate->dsa_signature_value );
+}
+
 static void output_x500_name( name *x500_name )
 {
   printf( "C=%s/ST=%s/L=%s/O=%s/OU=%s/CN=%s\n",
@@ -740,6 +839,15 @@ static void display_x509_certificate( signed_x509_certificate *certificate )
     case dh:
       printf( "DH\n" );
       break;
+    case ecdsa:
+      printf( "ECDSA\n" );
+      printf( "x: " );
+      print_huge(
+        &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key.x );
+      printf( "y: " );
+      print_huge(
+        &certificate->tbsCertificate.subjectPublicKeyInfo.ecdsa_public_key.y );
+      break;
     default:
       printf( "?\n" );
       break;
@@ -757,6 +865,9 @@ static void display_x509_certificate( signed_x509_certificate *certificate )
     case shaWithDSA:
       printf( "SHA-1 with DSA\n" );
       break;
+    case sha256WithECDSA:
+      printf( "SHA-256 with ECDSA\n" );
+      break;
   }
 
   printf( "Signature value: " );
@@ -767,6 +878,7 @@ static void display_x509_certificate( signed_x509_certificate *certificate )
       print_huge( &certificate->rsa_signature_value );
       break;
     case shaWithDSA:
+    case sha256WithECDSA:
       printf( "\n\tr:" );
       print_huge( &certificate->dsa_signature_value.r );
       printf( "\ts:" );
@@ -856,6 +968,16 @@ int main( int argc, char *argv[ ] )
       case shaWithRSAEncryption:
         if ( validate_certificate_rsa( &certificate,
           &certificate.tbsCertificate.subjectPublicKeyInfo.rsa_public_key ) )
+        {
+          printf( "Certificate is a valid self-signed certificate.\n" );
+        }
+        else
+        {
+          printf( "Certificate is corrupt or not self-signed.\n" );
+        }
+        break;
+      case sha256WithECDSA:
+        if ( validate_certificate_ecdsa( &certificate ) )
         {
           printf( "Certificate is a valid self-signed certificate.\n" );
         }

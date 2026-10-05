@@ -5,12 +5,14 @@
 #include "huge.h"
 #include "rsa.h"
 #include "dsa.h"
+#include "ecc.h"
 
 typedef enum
 {
   rsa,
   dsa,
-  dh
+  dh,
+  ecdsa
 }
 algorithmIdentifier;
 
@@ -18,7 +20,8 @@ typedef enum
 {
   md5WithRSAEncryption,
   shaWithRSAEncryption,
-  shaWithDSA
+  shaWithDSA,
+  sha256WithECDSA
 }
 signatureAlgorithmIdentifier;
 
@@ -57,6 +60,9 @@ typedef struct
   dsa_params dsa_parameters;
   // DSA parameters, only if algorithm == dsa
   huge dsa_public_key;
+  // ECDSA curve and public key, only if algorithm == ecdsa
+  elliptic_curve ecdsa_curve;
+  point ecdsa_public_key;
 }
 public_key_info;
 

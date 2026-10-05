@@ -75,6 +75,15 @@ void PRF( const unsigned char *secret,
           unsigned char *output,
           int out_len )
 {
+#if TLS_VERSION_MINOR >= 3
+  // TLS 1.2: a single P_hash with SHA-256 over the whole secret
+  unsigned char *concat = ( unsigned char * ) malloc( label_len + seed_len );
+  memcpy( concat, label, label_len );
+  memcpy( concat + label_len, seed, seed_len );
+  P_hash( secret, secret_len, concat, label_len + seed_len, output,
+    out_len, new_sha256_digest );
+  free( concat );
+#else
   int i;
   int half_secret_len;
   unsigned char *sha1_out = ( unsigned char * ) malloc( out_len );
@@ -95,6 +104,7 @@ void PRF( const unsigned char *secret,
 
   free( sha1_out );
   free( concat );
+#endif
 }
 
 #ifdef TEST_PRF

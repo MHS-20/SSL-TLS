@@ -3,6 +3,7 @@
 #include <string.h>
 #include "aes.h"
 #include "hex.h"
+#include <arpa/inet.h>
 
 static void xor( unsigned char *target, const unsigned char *src, int len )
 {
@@ -461,25 +462,481 @@ void aes_256_decrypt( const unsigned char *ciphertext,
   aes_decrypt( ciphertext, ciphertext_len, plaintext, iv, key, 32 );
 }
 
+
+/**
+ * AES-CTR mode. The iv is a 16-byte nonce whose last four
+ * bytes are the block counter; it's updated in place.
+ */
+void aes_ctr_encrypt( const unsigned char *input,
+                      int input_len,
+                      unsigned char *output,
+                      void *iv,
+                      const unsigned char *key )
+{
+  unsigned char *nonce = ( unsigned char * ) iv;
+  unsigned char input_block[ AES_BLOCK_SIZE ];
+  unsigned int next_nonce;
+  int block_size;
+
+  while ( input_len )
+  {
+    block_size = ( input_len < AES_BLOCK_SIZE ) ? input_len : AES_BLOCK_SIZE;
+    aes_block_encrypt( nonce, input_block, key, 16 );
+    xor( input_block, input, block_size ); // implement CTR
+    memcpy( ( void * ) output, ( void * ) input_block, block_size );
+
+    memcpy( ( void * ) &next_nonce, ( void * ) ( nonce + 12 ),
+      sizeof( unsigned int ) );
+    // Have to preserve byte ordering to be NIST compliant
+    next_nonce = ntohl( next_nonce );
+    next_nonce++;
+    next_nonce = htonl( next_nonce );
+    memcpy( ( void * ) ( nonce + 12 ), ( void * ) &next_nonce,
+      sizeof( unsigned int ) );
+
+    input += block_size;
+    output += block_size;
+    input_len -= block_size;
+  }
+}
+
+/**
+ * CBC-MAC: CBC-encrypt with a zero IV and keep only the
+ * last block. text_length must be a multiple of the block size.
+ */
+void aes_cbc_mac( const unsigned char *key,
+                  int key_length,
+                  const unsigned char *text,
+                  int text_length,
+                  unsigned char *mac )
+{
+  unsigned char input_block[ AES_BLOCK_SIZE ];
+  unsigned char mac_block[ AES_BLOCK_SIZE ];
+
+  memset( mac_block, '\0', AES_BLOCK_SIZE );
+
+  while ( text_length >= AES_BLOCK_SIZE )
+  {
+    memcpy( input_block, text, AES_BLOCK_SIZE );
+    xor( input_block, mac_block, AES_BLOCK_SIZE );
+    aes_block_encrypt( input_block, mac_block, key, key_length );
+    text += AES_BLOCK_SIZE;
+    text_length -= AES_BLOCK_SIZE;
+  }
+
+  memcpy( mac, mac_block, MAC_LENGTH );
+}
+
+/**
+ * This implements 128-bit AES-CCM.
+ * The IV is the nonce; it should be eight bytes long.
+ * When encrypting, output must be input_len + MAC_LENGTH bytes.
+ * When decrypting, input_len includes the MAC; returns 0 if the MAC
+ * doesn't match.
+ */
+static int aes_ccm_process( const unsigned char *input,
+                            int input_len,
+                            const unsigned char *addldata,
+                            unsigned short addldata_len,
+                            unsigned char *output,
+                            void *iv,
+                            const unsigned char *key,
+                            int decrypt )
+{
+  unsigned char nonce[ AES_BLOCK_SIZE ];
+  unsigned char input_block[ AES_BLOCK_SIZE ];
+  unsigned char mac_block[ AES_BLOCK_SIZE ];
+  unsigned int next_nonce;
+  int process_len;
+  int block_size;
+  unsigned int header_length_declaration;
+
+  // The first input block is a (complicated) standardized header
+  // This is just for the MAC; not output
+  memset( input_block, '\0', AES_BLOCK_SIZE );
+  input_block[ 0 ] = 0x1F; // t = mac_length = 8 bytes, q = 8 bytes (so n = 7)
+  input_block[ 0 ] |= addldata_len ? 0x40 : 0x00;
+  process_len = input_len - ( decrypt ? MAC_LENGTH : 0 );
+  header_length_declaration = htonl( process_len );
+  memcpy( ( void * ) ( input_block + ( AES_BLOCK_SIZE - sizeof( int ) ) ),
+    &header_length_declaration, sizeof( unsigned int ) );
+  memcpy( ( void * ) ( input_block + 1 ), iv, 8 );
+
+  // update the CBC-MAC
+  memset( mac_block, '\0', AES_BLOCK_SIZE );
+  xor( input_block, mac_block, AES_BLOCK_SIZE );
+  aes_block_encrypt( input_block, mac_block, key, 16 );
+
+  if ( addldata_len )
+  {
+    unsigned short addldata_len_declare;
+    int addldata_block_len;
+
+    // First two bytes of addl data are the length in network order
+    addldata_len_declare = ntohs( addldata_len );
+    memset( input_block, '\0', AES_BLOCK_SIZE );
+    memcpy( input_block, ( void * ) &addldata_len_declare,
+      sizeof( unsigned short ) );
+    addldata_block_len = AES_BLOCK_SIZE - sizeof( unsigned short );
+    do
+    {
+      block_size = ( addldata_len < addldata_block_len ) ?
+        addldata_len : addldata_block_len;
+      memcpy( input_block + ( AES_BLOCK_SIZE - addldata_block_len ),
+        addldata, block_size );
+      xor( input_block, mac_block, AES_BLOCK_SIZE );
+      aes_block_encrypt( input_block, mac_block, key, 16 );
+      addldata_len -= block_size;
+      addldata += block_size;
+      addldata_block_len = AES_BLOCK_SIZE;
+      memset( input_block, '\0', addldata_block_len );
+    }
+    while ( addldata_len );
+  }
+
+  // Prepare the first nonce
+  memset( nonce, '\0', AES_BLOCK_SIZE );
+  nonce[ 0 ] = 0x07; // q hardcode to 8 bytes, so n = 7
+  memcpy( ( nonce + 1 ), iv, 8 );
+
+  while ( process_len )
+  {
+    // Increment counter
+    memcpy( ( void * ) &next_nonce, ( void * ) ( nonce + 12 ),
+      sizeof( unsigned int ) );
+    // Preserve byte ordering, although not strictly necessary
+    next_nonce = ntohl( next_nonce );
+    next_nonce++;
+    next_nonce = htonl( next_nonce );
+    memcpy( ( void * ) ( nonce + 12 ), ( void * ) &next_nonce,
+      sizeof( unsigned int ) );
+
+    // encrypt the nonce
+    block_size = ( process_len < AES_BLOCK_SIZE ) ?
+      process_len : AES_BLOCK_SIZE;
+    aes_block_encrypt( nonce, input_block, key, 16 );
+    xor( input_block, input, block_size ); // implement CTR
+    memcpy( output, input_block, block_size );
+
+    // update the CBC-MAC
+    memset( input_block, '\0', AES_BLOCK_SIZE );
+    memcpy( input_block, decrypt ? output : input, block_size );
+    xor( input_block, mac_block, AES_BLOCK_SIZE );
+    aes_block_encrypt( input_block, mac_block, key, 16 );
+
+    // advance to next block
+    input += block_size;
+    output += block_size;
+    process_len -= block_size;
+  }
+
+  // Regenerate the first nonce
+  memset( nonce, '\0', AES_BLOCK_SIZE );
+  nonce[ 0 ] = 0x07; // q hardcode to 8 bytes
+  memcpy( ( nonce + 1 ), iv, 8 );
+
+  // encrypt the header and output it
+  aes_block_encrypt( nonce, input_block, key, AES_BLOCK_SIZE );
+
+  // MAC is the CBC-mac XOR'ed with S0
+  if ( !decrypt )
+  {
+    xor( mac_block, input_block, MAC_LENGTH );
+    memcpy( output, mac_block, MAC_LENGTH );
+    return 1;
+  }
+  else
+  {
+    xor( input_block, input, MAC_LENGTH );
+    if ( memcmp( mac_block, input_block, MAC_LENGTH ) )
+    {
+      return 0;
+    }
+
+    return 1;
+  }
+}
+
+int aes_ccm_encrypt( const unsigned char *input,
+                     const int input_len,
+                     const unsigned char *addldata,
+                     const int addldata_len,
+                     unsigned char output[],
+                     void *iv,
+                     const unsigned char *key )
+{
+  return aes_ccm_process( input, input_len, addldata, addldata_len,
+    output, iv, key, 0 );
+}
+
+int aes_ccm_decrypt( const unsigned char *input,
+                     const int input_len,
+                     const unsigned char *addldata,
+                     const int addldata_len,
+                     unsigned char output[],
+                     void *iv,
+                     const unsigned char *key )
+{
+  return aes_ccm_process( input, input_len, addldata, addldata_len,
+    output, iv, key, 1 );
+}
+
+/**
+ * "Multiply" X by Y (in a GF-128 field) and return the result in Z.
+ * X, Y, and Z are all AES_BLOCK_SIZE in length.
+ */
+static void gf_multiply( const unsigned char *X,
+                         const unsigned char *Y,
+                         unsigned char *Z )
+{
+  unsigned char V[ AES_BLOCK_SIZE ];
+  unsigned char R[ AES_BLOCK_SIZE ];
+  unsigned char mask;
+  int i, j;
+  int lsb;
+
+  memset( Z, '\0', AES_BLOCK_SIZE );
+  memset( R, '\0', AES_BLOCK_SIZE );
+  R[ 0 ] = 0xE1;
+  memcpy( V, X, AES_BLOCK_SIZE );
+  for ( i = 0; i < 16; i++ )
+  {
+    for ( mask = 0x80; mask; mask >>= 1 )
+    {
+      if ( Y[ i ] & mask )
+      {
+        xor( Z, V, AES_BLOCK_SIZE );
+      }
+
+      lsb = ( V[ AES_BLOCK_SIZE - 1 ] & 0x01 );
+      for ( j = AES_BLOCK_SIZE - 1; j; j-- )
+      {
+        V[ j ] = ( V[ j ] >> 1 ) | ( ( V[ j - 1 ] & 0x01 ) << 7 );
+      }
+      V[ 0 ] >>= 1;
+
+      if ( lsb )
+      {
+        xor( V, R, AES_BLOCK_SIZE );
+      }
+    }
+  }
+}
+
+/**
+ * Standalone GHASH; aes_gcm_process inlines the same
+ * computation.
+ */
+void ghash( unsigned char *H,
+            unsigned char *X,
+            int X_len,
+            unsigned char *Y ) // Y is the output value
+{
+  unsigned char X_block[ AES_BLOCK_SIZE ];
+  unsigned int input_len;
+  int process_len;
+
+  memset( Y, '\0', AES_BLOCK_SIZE );
+  input_len = htonl( X_len << 3 ); // remember this for final block
+
+  while ( X_len )
+  {
+    process_len = ( X_len < AES_BLOCK_SIZE ) ? X_len : AES_BLOCK_SIZE;
+    memset( X_block, '\0', AES_BLOCK_SIZE );
+    memcpy( X_block, X, process_len );
+    xor( X_block, Y, AES_BLOCK_SIZE );
+    gf_multiply( X_block, H, Y );
+
+    X += process_len;
+    X_len -= process_len;
+  }
+
+  // Hash the length of the ciphertext as well
+  memset( X_block, '\0', AES_BLOCK_SIZE );
+  memcpy( X_block + 12, ( void * ) &input_len, sizeof( unsigned int ) );
+  xor( X_block, Y, AES_BLOCK_SIZE );
+  gf_multiply( X_block, H, Y );
+}
+
+/**
+ * This implements 128-bit AES-GCM.
+ * IV must be exactly 12 bytes long.
+ * When encrypting, output must be exactly 16 bytes longer than input.
+ * When decrypting, input_len includes the 16-byte MAC; returns non-zero
+ * if the MAC doesn't match.
+ */
+static int aes_gcm_process( const unsigned char *input,
+                            int input_len,
+                            const unsigned char *addl_data,
+                            unsigned short addldata_len,
+                            unsigned char *output,
+                            void *iv,
+                            const unsigned char *key,
+                            int decrypt )
+{
+  unsigned char nonce[ AES_BLOCK_SIZE ];
+  unsigned char input_block[ AES_BLOCK_SIZE ];
+  unsigned char zeros[ AES_BLOCK_SIZE ];
+  unsigned char H[ AES_BLOCK_SIZE ];
+  unsigned char mac_block[ AES_BLOCK_SIZE ];
+  unsigned int next_nonce;
+  int original_input_len, original_addl_len;
+  int process_len;
+  int block_size;
+
+  memset( zeros, '\0', AES_BLOCK_SIZE );
+  aes_block_encrypt( zeros, H, key, 16 );
+  memcpy( nonce, iv, 12 );
+  memset( nonce + 12, '\0', sizeof( unsigned int ) );
+
+  process_len = input_len - ( decrypt ? AES_BLOCK_SIZE : 0 );
+
+  // MAC initialization
+  memset( mac_block, '\0', AES_BLOCK_SIZE );
+  original_input_len = htonl( process_len << 3 ); // remember this for final block
+  original_addl_len = htonl( addldata_len << 3 ); // remember this for final block
+
+  while ( addldata_len )
+  {
+    block_size = ( addldata_len < AES_BLOCK_SIZE ) ?
+      addldata_len : AES_BLOCK_SIZE;
+    memset( input_block, '\0', AES_BLOCK_SIZE );
+    memcpy( input_block, addl_data, block_size );
+    xor( input_block, mac_block, AES_BLOCK_SIZE );
+    gf_multiply( input_block, H, mac_block );
+    addl_data += block_size;
+    addldata_len -= block_size;
+  }
+
+  next_nonce = htonl( 1 );
+
+  while ( process_len )
+  {
+    next_nonce = ntohl( next_nonce );
+    next_nonce++;
+    next_nonce = htonl( next_nonce );
+    memcpy( ( void * ) ( nonce + 12 ), ( void * ) &next_nonce,
+      sizeof( unsigned int ) );
+
+    block_size = ( process_len < AES_BLOCK_SIZE ) ? process_len : AES_BLOCK_SIZE;
+    aes_block_encrypt( nonce, input_block, key, 16 );
+    xor( input_block, input, block_size ); // implement CTR
+    memcpy( ( void * ) output, ( void * ) input_block, block_size );
+
+    if ( decrypt )
+    {
+      // When decrypting, put the input - e.g. the ciphertext -
+      // back into the input block for the MAC computation below
+      memcpy( input_block, input, block_size );
+    }
+
+    // Update the MAC; input_block contains encrypted value
+    memset( ( input_block + AES_BLOCK_SIZE ) -
+      ( AES_BLOCK_SIZE - block_size ), '\0',
+      AES_BLOCK_SIZE - block_size );
+    xor( input_block, mac_block, AES_BLOCK_SIZE );
+    gf_multiply( input_block, H, mac_block );
+
+    input += block_size;
+    output += block_size;
+    process_len -= block_size;
+  }
+
+  memset( input_block, '\0', AES_BLOCK_SIZE );
+  memcpy( input_block + 4, ( void * ) &original_addl_len,
+    sizeof( unsigned int ) );
+  memcpy( input_block + 12, ( void * ) &original_input_len,
+    sizeof( unsigned int ) );
+  xor( input_block, mac_block, AES_BLOCK_SIZE );
+
+  memset( nonce + 12, '\0', sizeof( unsigned int ) );
+  nonce[ 15 ] = 0x01;
+
+  if ( !decrypt )
+  {
+    gf_multiply( input_block, H, output );
+
+    // Now encrypt the MAC block and output it
+    aes_block_encrypt( nonce, input_block, key, 16 );
+    xor( output, input_block, AES_BLOCK_SIZE );
+  }
+  else
+  {
+    gf_multiply( input_block, H, mac_block );
+
+    // Now decrypt the final (MAC) block and compare it
+    aes_block_encrypt( nonce, input_block, key, 16 );
+    xor( input_block, input, AES_BLOCK_SIZE );
+    if ( memcmp( mac_block, input_block, AES_BLOCK_SIZE ) )
+    {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+int aes_gcm_encrypt( const unsigned char *input,
+                     const int input_len,
+                     const unsigned char *addldata,
+                     const int addldata_len,
+                     unsigned char output[],
+                     void *iv,
+                     const unsigned char *key )
+{
+  return aes_gcm_process( input, input_len, addldata, addldata_len,
+    output, iv, key, 0 );
+}
+
+int aes_gcm_decrypt( const unsigned char *input,
+                     const int input_len,
+                     const unsigned char *addldata,
+                     const int addldata_len,
+                     unsigned char output[],
+                     void *iv,
+                     const unsigned char *key )
+{
+  return aes_gcm_process( input, input_len, addldata, addldata_len,
+    output, iv, key, 1 );
+}
+
 #ifdef TEST_AES
+static void usage( char *prog )
+{
+  fprintf( stderr, "Usage: %s [-e|-d|-ctr|-ccm-e|-ccm-d|-gcm-e|-gcm-d] "
+    "<key> <iv> <input> [<addl data>]\n", prog );
+  exit( 0 );
+}
+
 int main( int argc, char *argv[ ] )
 {
   unsigned char *key;
   unsigned char *input;
   unsigned char *iv;
+  unsigned char *addl_data;
   int key_len;
   int input_len;
   int iv_len;
+  int addldata_len;
 
   if ( argc < 5 )
   {
-    fprintf( stderr, "Usage: %s [-e|-d] <key> <iv> <input>\n", argv[ 0 ] );
-    exit( 0 );
+    usage( argv[ 0 ] );
   }
 
   key_len = hex_decode( argv[ 2 ], &key );
   iv_len = hex_decode( argv[ 3 ], &iv );
   input_len = hex_decode( argv[ 4 ], &input );
+
+  if ( argc > 5 )
+  {
+    addldata_len = hex_decode( argv[ 5 ], &addl_data );
+  }
+  else
+  {
+    addldata_len = 0;
+    addl_data = NULL;
+  }
 
   if ( !strcmp( argv[ 1 ], "-e" ) )
   {
@@ -525,13 +982,73 @@ int main( int argc, char *argv[ ] )
 
     free( plaintext );
   }
+  else if ( !strcmp( argv[ 1 ], "-ctr" ) )
+  {
+    unsigned char *output = ( unsigned char * ) malloc( input_len );
+    unsigned char nonce[ AES_BLOCK_SIZE ];
+
+    memset( nonce, '\0', AES_BLOCK_SIZE );
+    memcpy( nonce, iv, iv_len > AES_BLOCK_SIZE ? AES_BLOCK_SIZE : iv_len );
+    aes_ctr_encrypt( input, input_len, output, nonce, key );
+    show_hex( output, input_len );
+    free( output );
+  }
+  else if ( !strcmp( argv[ 1 ], "-ccm-e" ) || !strcmp( argv[ 1 ], "-gcm-e" ) )
+  {
+    int gcm = !strcmp( argv[ 1 ], "-gcm-e" );
+    int mac_len = gcm ? AES_BLOCK_SIZE : MAC_LENGTH;
+    unsigned char *ciphertext = ( unsigned char * )
+      malloc( input_len + mac_len );
+    unsigned char nonce[ 12 ];
+
+    memset( nonce, '\0', sizeof( nonce ) );
+    memcpy( nonce, iv, iv_len > 12 ? 12 : iv_len );
+    if ( gcm )
+    {
+      aes_gcm_encrypt( input, input_len, addl_data, addldata_len, ciphertext,
+        ( void * ) nonce, key );
+    }
+    else
+    {
+      aes_ccm_encrypt( input, input_len, addl_data, addldata_len, ciphertext,
+        ( void * ) nonce, key );
+    }
+    show_hex( ciphertext, input_len + mac_len );
+    free( ciphertext );
+  }
+  else if ( !strcmp( argv[ 1 ], "-ccm-d" ) || !strcmp( argv[ 1 ], "-gcm-d" ) )
+  {
+    int gcm = !strcmp( argv[ 1 ], "-gcm-d" );
+    int mac_len = gcm ? AES_BLOCK_SIZE : MAC_LENGTH;
+    unsigned char *plaintext = ( unsigned char * )
+      malloc( input_len - mac_len );
+    unsigned char nonce[ 12 ];
+
+    memset( nonce, '\0', sizeof( nonce ) );
+    memcpy( nonce, iv, iv_len > 12 ? 12 : iv_len );
+    if ( gcm ? aes_gcm_decrypt( input, input_len, addl_data, addldata_len,
+                 plaintext, ( void * ) nonce, key ) :
+               !aes_ccm_decrypt( input, input_len, addl_data, addldata_len,
+                 plaintext, ( void * ) nonce, key ) )
+    {
+      fprintf( stderr, "Error, MAC mismatch.\n" );
+    }
+    else
+    {
+      show_hex( plaintext, input_len - mac_len );
+    }
+    free( plaintext );
+  }
   else
   {
-    fprintf( stderr, "Usage: %s [-e|-d] <key> <iv> <input>\n", argv[ 0 ] );
+    usage( argv[ 0 ] );
   }
 
   free( iv );
   free( key );
   free( input );
+  free( addl_data );
+
+  return 0;
 }
 #endif

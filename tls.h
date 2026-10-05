@@ -68,7 +68,19 @@ typedef enum
   TLS_DHE_DSS_WITH_AES_256_CBC_SHA = 0x0038,
   TLS_DHE_RSA_WITH_AES_256_CBC_SHA = 0x0039,
   TLS_DH_anon_WITH_AES_256_CBC_SHA = 0x003A,
-  MAX_SUPPORTED_CIPHER_SUITE = 0x003B
+
+  // AES-GCM - RFC 5288
+  TLS_RSA_WITH_AES_128_GCM_SHA256 = 0x009C,
+
+  // ECC cipher suites - RFC 4492
+  TLS_ECDHE_ECDSA_WITH_RC4_128_SHA = 0xC007,
+  TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA = 0xC008,
+  TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA = 0xC009,
+  TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA = 0xC00A,
+  // ECDHE with an RSA-signed server key exchange
+  TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013,
+  TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014,
+  MAX_SUPPORTED_CIPHER_SUITE = 0xC015
 } CipherSuiteIdentifier;
 
 typedef struct
@@ -91,8 +103,26 @@ typedef struct
                         void *iv,
                         const unsigned char *key );
   void (*new_digest)( digest_ctx *context );
+  int (*aead_encrypt)( const unsigned char *plaintext,
+                       const int plaintext_len,
+                       const unsigned char *addldata,
+                       const int addldata_len,
+                       unsigned char ciphertext[],
+                       void *iv,
+                       const unsigned char *key );
+  int (*aead_decrypt)( const unsigned char *ciphertext,
+                       const int ciphertext_len,
+                       const unsigned char *addldata,
+                       const int addldata_len,
+                       unsigned char plaintext[],
+                       void *iv,
+                       const unsigned char *key );
 }
 CipherSuite;
+
+// RFC 5288: the GCM nonce is a 4-byte implicit salt from the key block
+// followed by an 8-byte explicit part sent with each record.
+#define AEAD_EXPLICIT_NONCE_LEN 8
 
 typedef struct
 {
@@ -105,7 +135,11 @@ typedef struct
 ProtectionParameters;
 
 #define TLS_VERSION_MAJOR 3
+// 1 = TLS 1.0 (-8); build with -DTLS_VERSION_MINOR=3 for TLS 1.2
+//. 2 (TLS 1.1) only adds the explicit CBC IV.
+#ifndef TLS_VERSION_MINOR
 #define TLS_VERSION_MINOR 1
+#endif
 
 #define MASTER_SECRET_LENGTH 48
 typedef unsigned char master_secret_type[ MASTER_SECRET_LENGTH ];
@@ -138,6 +172,10 @@ typedef struct
   // a DH key for key exchange (e.g. DHE_RSA)
   dh_key server_dh_key;
 
+  // ECDH curve and public point from an ECDHE server key exchange
+  elliptic_curve server_ecdh_params;
+  point server_ecdh_key;
+
   // Internal state
   int got_client_hello;
   int got_server_hello;
@@ -146,6 +184,9 @@ typedef struct
   int got_certificate_request;
   digest_ctx md5_handshake_digest;
   digest_ctx sha1_handshake_digest;
+  // TLS 1.2 hashes the handshake with SHA-256 only; all three
+  // are kept so that either version can be compiled
+  digest_ctx sha256_handshake_digest;
   char *unread_buffer;
   int unread_length;
 
@@ -159,6 +200,30 @@ typedef struct
   unsigned char server_verify_data[ VERIFY_DATA_LEN ];
 }
 TLSParameters;
+
+/**
+ * TLS 1.2 signature and hash algorithm identifiers (RFC 5246 7.4.1.4.1)
+ */
+typedef enum
+{
+  none = 0,
+  md5 = 1,
+  sha1 = 2,
+  sha224 = 3,
+  sha256 = 4,
+  sha384 = 5,
+  sha512 = 6
+}
+HashAlgorithm;
+
+typedef enum
+{
+  anonymous = 0,
+  sig_rsa = 1,
+  sig_dsa = 2,
+  sig_ecdsa = 3
+}
+SignatureAlgorithm;
 
 /** This lists the type of higher-level TLS protocols that are defined */
 typedef enum {
