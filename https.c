@@ -164,10 +164,9 @@ void display_result( int connection, TLSParameters *tls_context )
   static char recv_buf[ BUFFER_SIZE + 1 ];
 
   while ( ( received = tls_recv( connection, recv_buf,
-            BUFFER_SIZE, 0, tls_context ) ) >= 0 )
+            BUFFER_SIZE, 0, tls_context ) ) > 0 )
   {
-    recv_buf[ received ] = '\0';
-    printf( "data: %s", recv_buf );
+    fwrite( recv_buf, 1, received, stdout );
   }
   printf( "\n" );
 }

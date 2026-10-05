@@ -202,6 +202,10 @@ typedef struct
   digest_ctx sha256_handshake_digest;
   char *unread_buffer;
   int unread_length;
+  // for tls_recv, whether the last record carried
+  // application data, and whether the peer sent close_notify
+  int got_application_data;
+  int peer_closed;
 
   // Session resumption
   int session_id_length;

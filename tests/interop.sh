@@ -99,5 +99,18 @@ server tls10-server-ecdhe      $B/ssl_webserver -- -tls1 -cipher "ECDHE-RSA-AES1
 server server-pem-default      $B/ssl_webserver -cert $WORK/cert.pem -key $WORK/key.pem -- -cipher "ALL:$S0"
 server tls12-server-gcm        $B/ssl_webserver -- -tls1_2 -cipher "AES128-GCM-SHA256:$S0"
 
+if wanted server-resumption; then
+  next_port
+  $B/ssl_webserver $PORT > w.log 2>&1 &
+  wp=$!
+  sleep 0.5
+  for i in 1 2; do
+    printf 'GET / HTTP/1.0\r\n\r\n' | timeout 30 openssl s_client -connect localhost:$PORT -tls1_2 \
+      -cipher "AES128-SHA:$S0" -ign_eof $([ $i = 1 ] && echo -sess_out || echo -sess_in) sess.pem > r$i.log 2>&1
+  done
+  kill $wp 2>/dev/null; wait $wp 2>/dev/null
+  grep -q "^Reused" r2.log && report server-resumption 1 || report server-resumption 0 r2.log w.log
+fi
+
 echo "$FAILS failure(s)"
 exit $FAILS

@@ -31,12 +31,8 @@ char *read_line( int connection, TLSParameters *tls_context )
     line = malloc( line_len );
   }
 
-  while ( ( size = tls_recv( connection, &c, 1, 0, tls_context ) ) >= 0 )
+  while ( ( size = tls_recv( connection, &c, 1, 0, tls_context ) ) > 0 )
   {
-    if ( size == 0 )
-    {
-      continue; // a non-data record (e.g. empty) - keep reading
-    }
     if ( ( c == '\n' ) && ( line[ pos - 1 ] == '\r' ) )
     {
       line[ pos - 1 ] = '\0';

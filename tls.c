@@ -171,6 +171,8 @@ static void init_parameters( TLSParameters *parameters,
   parameters->unread_buffer = NULL;
   parameters->unread_length = 0;
   parameters->session_id_length = 0;
+  parameters->got_application_data = 0;
+  parameters->peer_closed = 0;
 }
 
 /**
@@ -381,17 +383,24 @@ static int send_handshake_message( int connection,
   return response;
 }
 
+static int send_alert( int connection,
+                       int level,
+                       int alert_code,
+                       ProtectionParameters *parameters )
+{
+  char buffer[ 2 ];
+
+  buffer[ 0 ] = level;
+  buffer[ 1 ] = alert_code;
+
+  return send_message( connection, content_alert, buffer, 2, parameters );
+}
+
 static int send_alert_message( int connection,
                                int alert_code,
                                ProtectionParameters *parameters )
 {
-  char buffer[ 2 ];
-
-  // TODO support warnings
-  buffer[ 0 ] = fatal;
-  buffer[ 1 ] = alert_code;
-
-  return send_message( connection, content_alert, buffer, 2, parameters );
+  return send_alert( connection, fatal, alert_code, parameters );
 }
 
 // lets the test client offer a different single suite
@@ -3134,10 +3143,19 @@ static int receive_tls_msg( int connection,
       read_pos = read_buffer( ( void * ) &alert.description,
         ( void * ) read_pos, 1 );
 
+      if ( alert.description == close_notify )
+      {
+        // the orderly end of the connection
+        parameters->peer_closed = 1;
+        free( decrypted_message );
+        return 0;
+      }
+
       report_alert( &alert );
 
       if ( alert.level == fatal )
       {
+        free( decrypted_message );
         return -1;
       }
     }
@@ -3153,8 +3171,10 @@ static int receive_tls_msg( int connection,
 
       if ( change_cipher_spec_type != 1 )
       {
-        printf( "Error - received message ChangeCipherSpec, but type != 1\n" );
-        exit( 0 );
+        send_alert_message( connection, unexpected_message,
+          &parameters->active_send_parameters );
+        free( decrypted_message );
+        return -1;
       }
       else
       {
@@ -3168,6 +3188,7 @@ static int receive_tls_msg( int connection,
   }
   else if ( message.type == content_application_data )
   {
+    parameters->got_application_data = 1;
     if ( decrypted_length <= bufsz )
     {
       memcpy( buffer, decrypted_message, decrypted_length );
@@ -3572,8 +3593,19 @@ int tls_send( int connection,
               int options,
               TLSParameters *parameters )
 {
-  send_message( connection, content_application_data, application_data, length,
-    &parameters->active_send_parameters );
+  int sent = 0;
+
+  while ( sent < length )
+  {
+    int chunk = ( length - sent > 16384 ) ? 16384 : length - sent;
+    if ( send_message( connection, content_application_data,
+           application_data + sent, chunk,
+           &parameters->active_send_parameters ) )
+    {
+      return -1;
+    }
+    sent += chunk;
+  }
 
   return length;
 }
@@ -3583,10 +3615,24 @@ int tls_recv( int connection, char *target_buffer, int buffer_size, int options,
 {
   int bytes_decrypted = 0;
 
-  bytes_decrypted = receive_tls_msg( connection, target_buffer, buffer_size,
-    parameters );
-
-  return bytes_decrypted;
+  for ( ;; )
+  {
+    if ( parameters->peer_closed )
+    {
+      return 0;
+    }
+    parameters->got_application_data = 0;
+    bytes_decrypted = receive_tls_msg( connection, target_buffer,
+      buffer_size, parameters );
+    if ( bytes_decrypted < 0 )
+    {
+      return -1;
+    }
+    if ( parameters->got_application_data && bytes_decrypted > 0 )
+    {
+      return bytes_decrypted;
+    }
+  }
 }
 
 static void free_protection_parameters( ProtectionParameters *parameters )
@@ -3607,7 +3653,7 @@ static void free_protection_parameters( ProtectionParameters *parameters )
 
 int tls_shutdown( int connection, TLSParameters *parameters )
 {
-  send_alert_message( connection, close_notify,
+  send_alert( connection, warning, close_notify,
     &parameters->active_send_parameters );
   if ( parameters->unread_buffer )
   {
