@@ -175,6 +175,87 @@ void display_result( int connection, TLSParameters *tls_context )
 /**
  * Simple command-line HTTP client.
  */
+/**
+ * Ask an HTTP proxy to open a tunnel to host:port with the CONNECT
+ * command (RFC 2817), so that the TLS handshake runs end to end
+ * through it. Returns 1 if the proxy answered 200.
+ */
+int http_connect( int connection,
+                  const char *host,
+                  int port,
+                  const char *proxy_user,
+                  const char *proxy_password )
+{
+  static char connect_command[ MAX_GET_COMMAND ];
+  int received = 0;
+  static char recv_buf[ BUFFER_SIZE + 1 ];
+  int http_status = 0;
+
+  sprintf( connect_command, "CONNECT %s:%d HTTP/1.1\r\n", host, port );
+  if ( send( connection, connect_command,
+             strlen( connect_command ), 0 ) == -1 )
+  {
+    return 0;
+  }
+
+  sprintf( connect_command, "Host: %s:%d\r\n", host, port );
+  if ( send( connection, connect_command,
+             strlen( connect_command ), 0 ) == -1 )
+  {
+    return 0;
+  }
+
+  if ( proxy_user )
+  {
+    int credentials_len = strlen( proxy_user ) +
+                          strlen( proxy_password ) + 1;
+    char *proxy_credentials = malloc( credentials_len + 1 );
+    char *auth_string = malloc( ( ( credentials_len * 4 ) / 3 ) + 4 );
+    sprintf( proxy_credentials, "%s:%s", proxy_user, proxy_password );
+    base64_encode( proxy_credentials, credentials_len, auth_string );
+    sprintf( connect_command, "Proxy-Authorization: BASIC %s\r\n",
+             auth_string );
+    if ( send( connection, connect_command,
+               strlen( connect_command ), 0 ) == -1 )
+    {
+      free( proxy_credentials );
+      free( auth_string );
+      return 0;
+    }
+    free( proxy_credentials );
+    free( auth_string );
+  }
+
+  sprintf( connect_command, "\r\n" );
+  if ( send( connection, connect_command,
+             strlen( connect_command ), 0 ) == -1 )
+  {
+    return 0;
+  }
+
+  // Have to read the response!
+  while ( ( received = recv( connection, recv_buf,
+                             BUFFER_SIZE, 0 ) ) > 0 )
+  {
+    recv_buf[ received ] = '\0';
+    if ( http_status == 0 )
+    {
+      if ( !strncmp( recv_buf, "HTTP", 4 ) )
+      {
+        http_status = atoi( recv_buf + 9 );
+        printf( "interpreted http status code %d\n", http_status );
+      }
+    }
+    if ( received >= 4 &&
+         !memcmp( recv_buf + ( received - 4 ), "\r\n\r\n", 4 ) )
+    {
+      break;
+    }
+  }
+
+  return ( http_status == 200 );
+}
+
 int main( int argc, char *argv[ ] )
 {
   int client_connection;
@@ -304,6 +385,21 @@ int main( int argc, char *argv[ ] )
   }
 
   printf( "Connection complete; negotiating TLS parameters\n" );
+
+  if ( proxy_host )
+  {
+    if ( !http_connect( client_connection, host, port, proxy_user,
+                        proxy_password ) )
+    {
+      perror( "Unable to establish proxy tunnel" );
+      if ( close( client_connection ) == -1 )
+      {
+        perror( "Error closing client connection" );
+        return 2;
+      }
+      return 3;
+    }
+  }
 
   if ( session_id != NULL )
   {

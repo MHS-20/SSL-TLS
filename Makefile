@@ -4,7 +4,7 @@ LDLIBS = -lm
 
 TESTS = des_test aes_test rc4_test rsa_test digest_test hmac_test dsa_test ecdsa_test ecc_int_test asn1_test x509_test
 
-all: http webserver https https12 prf_test ssl_webserver ssl_webserver12 privkey_test $(TESTS)
+all: http webserver https https12 openssl_https prf_test ssl_webserver ssl_webserver12 privkey_test $(TESTS)
 
 http: http.c base64.c
 	$(CC) $(CFLAGS) -o $@ $^
@@ -40,7 +40,7 @@ ecc_int_test: ecc_int.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
-	rm -f http webserver https https12 ssl_webserver ssl_webserver12 prf_test privkey_test $(TESTS) *.o
+	rm -f http webserver https https12 openssl_https ssl_webserver ssl_webserver12 prf_test privkey_test $(TESTS) *.o
 
 .PHONY: all clean
 
@@ -70,3 +70,7 @@ https12: https.c $(TLS_OBJS)
 
 ssl_webserver12: ssl_webserver.c $(TLS_OBJS)
 	$(CC) $(CFLAGS) -O2 -DTLS_VERSION_MINOR=3 -o $@ $^ $(LDLIBS)
+
+# : the same client on top of the OpenSSL library
+openssl_https: openssl_https.c
+	$(CC) $(CFLAGS) -o $@ $^ -lssl -lcrypto
