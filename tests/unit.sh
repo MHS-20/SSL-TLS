@@ -28,7 +28,7 @@ check sha1           a9993e364706816aba3e25717850c26c9cd0d89d ./digest_test -sha
 check sha256         ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ./digest_test -sha256 abc
 check hmac-md5       750c783e6ab0b503eaa86e310a5db738 ./hmac_test -md5 Jefe "what do ya want for nothing?"
 check hmac-sha1-long aa4ae5e15272d00e95705637ce8a3b55ed402112 ./hmac_test -sha1 \
-  0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   "Test Using Larger Than Block-Size Key - Hash Key First"
 check prf-reference       b5baf4722b91851a8816d22ebd8c1d8cc2e94d55 ./prf_test secret label seed 20
 check dsa-reference       14297f2522458d809b6c5752d3975a00bb0d89e0 ./dsa_test
