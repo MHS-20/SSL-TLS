@@ -1,0 +1,4 @@
+*.o
+/http
+/webserver
+/*_test
