@@ -426,7 +426,7 @@ static const unsigned short default_client_suites[] =
 #define NUM_DEFAULT_CLIENT_SUITES \
   ( sizeof( default_client_suites ) / sizeof( unsigned short ) )
 
-// Certificate verification trusted roots and the name
+// Certificate verification: trusted roots and the name
 // the server's certificate must carry. No roots = no verification.
 static signed_x509_certificate *trusted_roots = NULL;
 static int trusted_roots_count = 0;
@@ -461,7 +461,7 @@ int tls_set_credentials( const char *cert_file, const char *key_file,
 }
 
 /**
- * Load the original default files if nothing was configured.
+ * Load the default files if nothing was configured.
  */
 static int have_credentials( ConnectionEnd connection_end )
 {
@@ -661,7 +661,7 @@ static unsigned short add_client_hello_extensions( unsigned char **extensions,
     renegotiation_extension_length + 64 +
     ( expected_hostname ? strlen( expected_hostname ) + 9 : 0 ) );
 
-  // (it only parses SNI on the server): name the host, so
+  // name the host, so
   // a server hosting several sites can pick the right certificate. IP
   // addresses aren't allowed in SNI (RFC 6066 3).
   if ( expected_hostname && !is_ip_address( expected_hostname ) )
@@ -1981,8 +1981,7 @@ static int send_server_hello( int connection, TLSParameters *parameters )
 }
 
 /**
- * Send this side's certificate chain. reference: reads cert.der (one
- * certificate, length in a short). A client without credentials sends an
+ * Send this side's certificate chain.  A client without credentials sends an
  * empty list, which TLS allows.
  */
 static int send_certificate( int connection, TLSParameters *parameters )
@@ -2035,8 +2034,7 @@ static int send_server_hello_done( int connection, TLSParameters *parameters )
 
 /**
  * By the time this is called, "read_pos" points at an RSA encrypted
- * premaster secret, or (ECDHE) the client's public point. reference: RSA only,
- * re-reading key.pkcs8 for every handshake.
+ * premaster secret, or (ECDHE) the client's public point.
  */
 static unsigned char *parse_client_key_exchange( unsigned char *read_pos,
                                                  int pdu_length,
@@ -2363,7 +2361,7 @@ static int sign_params( TLSParameters *parameters,
 }
 
 /**
- * (its server only does RSA key exchange): pick an
+ * Pick an
  * ephemeral P-256 key and send it, signed, in a ServerKeyExchange.
  */
 static int send_server_key_exchange( int connection,
@@ -2972,8 +2970,7 @@ static int receive_tls_msg( int connection,
 
   if ( message.type == content_handshake )
   {
-    // ("TODO - this fails if the read, above, only got part
-    // of the message"): a handshake message may span records. Prepend what
+    // A handshake message may span records. Prepend what
     // was left over from the last record, and keep any incomplete tail.
     if ( parameters->handshake_pending_length )
     {

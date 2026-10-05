@@ -1,7 +1,6 @@
 /**
- * The HTTPS client from , reworked to use the OpenSSL library
- *. the original elides the URL parsing and socket setup ("…");
- * they are filled in here the same way as in https.c, without the proxy.
+ * The HTTP client on top of the SSLv2 library. There's no ssl_shutdown; SSLv2 didn't explicitly mark the end of a
+ * secure session.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,8 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include "ssl.h"
 
 #define HTTPS_PORT 443
 #define MAX_GET_COMMAND 255
@@ -50,27 +48,28 @@ static int parse_url( char *uri, char **host, int *port, char **path )
   return 0;
 }
 
-int http_get( int connection,
-              const char *path,
-              const char *host,
-              SSL *ssl )
+int http_get( int connection, const char *path, const char *host,
+              SSLParameters *ssl_context )
 {
   static char get_command[ MAX_GET_COMMAND ];
 
   sprintf( get_command, "GET /%s HTTP/1.1\r\n", path );
-  if ( SSL_write( ssl, get_command, strlen( get_command ) ) == -1 )
+  if ( ssl_send( connection, get_command, strlen( get_command ),
+                 0, ssl_context ) == -1 )
   {
     return -1;
   }
 
   sprintf( get_command, "Host: %s\r\n", host );
-  if ( SSL_write( ssl, get_command, strlen( get_command ) ) == -1 )
+  if ( ssl_send( connection, get_command, strlen( get_command ),
+                 0, ssl_context ) == -1 )
   {
     return -1;
   }
 
   strcpy( get_command, "Connection: Close\r\n\r\n" );
-  if ( SSL_write( ssl, get_command, strlen( get_command ) ) == -1 )
+  if ( ssl_send( connection, get_command, strlen( get_command ),
+                 0, ssl_context ) == -1 )
   {
     return -1;
   }
@@ -78,14 +77,15 @@ int http_get( int connection,
   return 0;
 }
 
-void display_result( int connection, SSL *ssl )
+void display_result( int connection, SSLParameters *ssl_context )
 {
   int received = 0;
   static char recv_buf[ BUFFER_SIZE + 1 ];
 
-  while ( SSL_get_error( ssl,
-          ( received = SSL_read( ssl, recv_buf, BUFFER_SIZE ) ) ) ==
-          SSL_ERROR_NONE )
+  // Can't exit when return value is 0 like in http.c, since empty SSL
+  // messages can be sent (openssl does this)
+  while ( ( received = ssl_recv( connection, recv_buf, BUFFER_SIZE,
+                                 0, ssl_context ) ) >= 0 )
   {
     recv_buf[ received ] = '\0';
     printf( "data: %s", recv_buf );
@@ -100,10 +100,7 @@ int main( int argc, char *argv[ ] )
   int port;
   struct hostent *host_name;
   struct sockaddr_in host_address;
-  SSL_CTX *ctx;
-  SSL *ssl;
-  BIO *sbio;
-  const SSL_METHOD *meth;
+  SSLParameters ssl_context;
 
   if ( argc < 2 || parse_url( argv[ 1 ], &host, &port, &path ) )
   {
@@ -111,12 +108,6 @@ int main( int argc, char *argv[ ] )
     return 1;
   }
 
-  // OpenSSL-specific setup stuff
-  // OpenSSL 1.1+ initializes itself and calls the method TLS_client_method
-  meth = TLS_client_method();
-  ctx = SSL_CTX_new( meth );
-
-  // set up the connection itself
   if ( !( host_name = gethostbyname( host ) ) )
   {
     perror( "Error in name resolution" );
@@ -127,44 +118,26 @@ int main( int argc, char *argv[ ] )
   host_address.sin_family = AF_INET;
   host_address.sin_port = htons( port );
   memcpy( &host_address.sin_addr, host_name->h_addr_list[ 0 ],
-          sizeof( struct in_addr ) );
+    sizeof( struct in_addr ) );
 
   if ( connect( client_connection, ( struct sockaddr * ) &host_address,
-       sizeof( host_address ) ) == -1 )
+                sizeof( host_address ) ) == -1 )
   {
     perror( "Unable to connect to host" );
-    return 4;
+    return 2;
   }
 
-  ssl = SSL_new( ctx );
-  sbio = BIO_new_socket( client_connection, BIO_NOCLOSE );
-  SSL_set_bio( ssl, sbio, sbio );
-
-  if ( SSL_connect( ssl ) <= 0 )
+  if ( ssl_connect( client_connection, &ssl_context ) )
   {
     fprintf( stderr, "Error: unable to negotiate SSL connection.\n" );
-    ERR_print_errors_fp( stderr );
-    if ( close( client_connection ) == -1 )
-    {
-      perror( "Error closing client connection" );
-      return 2;
-    }
     return 3;
   }
 
-  http_get( client_connection, path, host, ssl );
+  http_get( client_connection, path, host, &ssl_context );
 
-  display_result( client_connection, ssl );
+  display_result( client_connection, &ssl_context );
 
-  SSL_shutdown( ssl );
-  SSL_free( ssl );
-  SSL_CTX_free( ctx );
-
-  if ( close( client_connection ) == -1 )
-  {
-    perror( "Error closing client connection" );
-    return 2;
-  }
+  close( client_connection );
 
   return 0;
 }

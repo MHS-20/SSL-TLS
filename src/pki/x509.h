@@ -23,7 +23,7 @@ typedef enum
   shaWithRSAEncryption,
   shaWithDSA,
   sha256WithECDSA,
-  sha256WithRSAEncryption,      // 
+  sha256WithRSAEncryption,
   sha384WithRSAEncryption,
   sha512WithRSAEncryption,
   sha384WithECDSA,

@@ -435,8 +435,7 @@ int compare( huge *h1, huge *h2 )
  * "started".
  */
 /**
- * dividend = dividend mod divisor (keeping dividend's sign, as the reference
- * does); quotient (if not NULL) = |dividend| / |divisor| with the sign of
+ * dividend = dividend mod divisor (keeping dividend's sign); quotient (if not NULL) = |dividend| / |divisor| with the sign of
  * the true quotient. Knuth's Algorithm D (TAOCP 4.3.1).
  */
 void divide( huge *dividend, huge *divisor, huge *quotient )

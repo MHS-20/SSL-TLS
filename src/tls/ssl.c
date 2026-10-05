@@ -13,7 +13,7 @@
 #include "hex.h"
 #include "random.h"
 
-// The replay test in main() needs the original fixed challenge, master key
+// The replay test in main() needs the capture's fixed challenge, master key
 // and IVs; everything else gets random ones.
 static int deterministic = 0;
 
@@ -882,7 +882,7 @@ int ssl_recv( int connection, char *target_buffer, int buffer_size,
 
 #ifdef TEST_SSL2
 /**
- * Replays the handshake captured in Appendix C (DES-CBC-MD5 against
+ * Replays the handshake of a recorded session (DES-CBC-MD5 against
  * OpenSSL 1.0.0): checks the derived keys, decrypts and MAC-checks the
  * server's server_verify and server_finished records, and checks that
  * client_finished and the GET request encrypt to the captured bytes.
@@ -894,7 +894,7 @@ static int check( const char *what, const unsigned char *got,
   int len = hex_decode( expected_hex, &expected );
   int ok = !memcmp( got, expected, len );
 
-  printf( "%-16s %s\n", what, ok ? "matches the reference" : "MISMATCH" );
+  printf( "%-16s %s\n", what, ok ? "matches capture" : "MISMATCH" );
   if ( !ok )
   {
     show_hex( got, len );

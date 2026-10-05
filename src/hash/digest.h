@@ -3,7 +3,7 @@
 
 #define DIGEST_BLOCK_SIZE 64
 #define INPUT_BLOCK_SIZE 56
-// SHA-384/512 use 128-byte blocks 
+// SHA-384/512 use 128-byte blocks
 #define MAX_DIGEST_BLOCK_SIZE 128
 
 typedef struct

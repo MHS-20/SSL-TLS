@@ -1,5 +1,10 @@
+SRC_DIRS = src/util src/cipher src/hash src/pubkey src/pki src/tls src/apps
+vpath %.c $(SRC_DIRS)
+vpath %.h $(SRC_DIRS)
+
 CC ?= gcc
 CFLAGS ?= -g -w
+CFLAGS += $(addprefix -I,$(SRC_DIRS))
 LDLIBS = -lm
 
 TESTS = des_test aes_test rc4_test rsa_test digest_test hmac_test dsa_test ecdsa_test ecc_int_test asn1_test x509_test
@@ -65,11 +70,11 @@ privkey_test: privkey.c file.c asn1.c base64.c huge.c digest.c md5.c sha.c sha51
 	$(CC) $(CFLAGS) -DTEST_PRIVKEY -o $@ $^ $(LDLIBS)
 
 
-# : the same client on top of the OpenSSL library
+# the same client on top of the OpenSSL library
 openssl_https: openssl_https.c
 	$(CC) $(CFLAGS) -o $@ $^ -lssl -lcrypto
 
-# Appendix C: SSLv2 client, and a replay of the original SSLv2 capture
+# SSLv2 client, and a replay of a recorded SSLv2 session
 SSL2_OBJS = ssl.c random.c x509.c asn1.c base64.c rsa.c dsa.c ecdsa.c ecc.c huge.c digest.c md5.c sha.c sha512.c des.c rc4.c hex.c
 
 ssl2_https: ssl2_https.c $(SSL2_OBJS)

@@ -328,7 +328,7 @@ static const unsigned char OID_ECDSA[] =
 // A.K.A. secp192R1, AKA NIST P-192
 static const unsigned char OID_PRIME192V1[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x01 };
-// A.K.A. secp256R1, AKA NIST P-256 
+// A.K.A. secp256R1, AKA NIST P-256
 static const unsigned char OID_PRIME256V1[] =
   { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
 static const unsigned char OID_SECP384R1[] =

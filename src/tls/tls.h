@@ -141,9 +141,7 @@ typedef struct
 ProtectionParameters;
 
 #define TLS_VERSION_MAJOR 3
-// Minor version numbers. the original compiles one version in (-8 use
-// 3.1,  changes it to 3.3); here the version is negotiated at run
-// time between tls_set_version_range's bounds (default TLS 1.0 - TLS 1.2).
+// Minor version numbers; the version is negotiated at run time between tls_set_version_range's bounds (default TLS 1.0 - TLS 1.2).
 #define TLS_1_0 1
 #define TLS_1_1 2
 #define TLS_1_2 3
@@ -409,7 +407,7 @@ void tls_set_version_range( int min_version, int max_version );
  * Make clients verify the server's certificate chain against the roots in
  * ca_file (a PEM bundle) and, if hostname isn't NULL, check that the leaf
  * certificate names it; hostname is also sent as SNI. ca_file NULL turns
- * verification off (the original behavior). Returns the number of roots
+ * verification off. Returns the number of roots
  * loaded, or -1.
  */
 int tls_set_verify( const char *ca_file, const char *hostname );
@@ -418,7 +416,7 @@ int tls_set_verify( const char *ca_file, const char *hostname );
  * The certificate chain and RSA key this side presents: the server's
  * identity, or the client's when the server asks for one. See
  * credentials.h for the accepted formats. Without this the server falls
- * back to the original cert.der + key.pkcs8 ("password"), and the client to
+ * back to cert.der + key.pkcs8 ("password"), and the client to
  * cert.der + key.der. Returns 0 on success.
  */
 int tls_set_credentials( const char *cert_file, const char *key_file,

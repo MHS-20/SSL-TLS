@@ -2,8 +2,7 @@
 #define CREDENTIALS_H
 
 /**
- * A certificate chain and its RSA private key, loaded from files. Not in
- * the reference, which hardcodes cert.der and key.pkcs8 / key.der.
+ * A certificate chain and its RSA private key, loaded from files.
  */
 
 #include "rsa.h"
@@ -23,7 +22,7 @@ tls_credentials;
 /**
  * cert_file: one DER certificate, or PEM with one or more (leaf first).
  * key_file: an RSA key as PEM or DER, PKCS #1 ("RSA PRIVATE KEY"),
- * PKCS #8 ("PRIVATE KEY") or the original encrypted PKCS #8 (password).
+ * PKCS #8 ("PRIVATE KEY") or encrypted PKCS #8 (PBE-MD5-DES) (password).
  * Returns 0 on success.
  */
 int load_credentials( tls_credentials *credentials,

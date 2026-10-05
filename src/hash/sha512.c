@@ -1,8 +1,8 @@
 /**
- * SHA-384 and SHA-512 (FIPS 180-4). needed to verify the
+ * SHA-384 and SHA-512 (FIPS 180-4), needed to verify the
  * sha384WithRSA / ecdsa-with-SHA384 signatures on current certificates.
  * The state lives in the digest_ctx hash buffer as big-endian bytes, so
- * that, as with the original SHA-256, the finished hash can be copied out
+ * that, as with SHA-256 in sha.c, the finished hash can be copied out
  * directly.
  */
 #include <stdlib.h>
